@@ -1,0 +1,88 @@
+"use client";
+
+// The header's right end: the helper's switch and the user. On a tablet and a desktop it is the box it always was (the switch, the name and the
+// role, the Kilépés button). On a phone (Lili 2026-10-30 20:43 UTC, msg 1565813299197517825, task caparium-fejlec-telefon: "szerinted nem nagy ez
+// a holtter a fejlecben?") it is one small button with the user's monogram, and what the box held opens under it: the name and the role, the
+// helper's switch, the Kilépés. The server and the first client render say "not a phone", so nothing changes for the larger screens.
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { HelperToggle } from "./HelperToggle";
+import { useTr } from "./LangProvider";
+import { LangSwitch } from "./LangSwitch";
+import { useIsPhone } from "./useIsPhone";
+
+export function TopbarUser({ name, roleLabel, monogram, helper }: { name: string; roleLabel: string; monogram: string; helper: boolean }) {
+  const phone = useIsPhone();
+  const tr = useTr();
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: PointerEvent) => {
+      if (!box.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const esc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", away);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("pointerdown", away);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [open]);
+  if (!phone) {
+    return (
+      <>
+        {helper && <HelperToggle />}
+        <div className="userbox">
+          <span data-testid="current-user">
+            {name} · {roleLabel}
+          </span>
+          {/* Lili 2026-11-01 (point 11): the own name and password */}
+          <Link className="btn btn-soft" href="/profil">
+            {tr("Saját beállítások")}
+          </Link>
+          <form method="post" action="/api/auth/logout">
+            <button className="btn btn-soft" type="submit">
+              {tr("Kilépés")}
+            </button>
+          </form>
+        </div>
+      </>
+    );
+  }
+  return (
+    <div className="profile no-print" ref={box}>
+      <button
+        type="button"
+        className="profile-btn"
+        aria-expanded={open}
+        aria-haspopup="true"
+        aria-label={tr("{name}, profil", { name })}
+        data-testid="profile-button"
+        onClick={() => setOpen(!open)}
+      >
+        {monogram}
+      </button>
+      {open && (
+        <div className="profile-panel" role="group" aria-label={tr("Profil")} data-testid="profile-panel">
+          <span data-testid="current-user">
+            {name} · {roleLabel}
+          </span>
+          {helper && <HelperToggle />}
+          {/* on a phone the HU/EN switch is here, not in the one-row header (the header's own is hidden, globals.css) */}
+          <LangSwitch />
+          <Link href="/profil" onClick={() => setOpen(false)}>
+            {tr("Saját beállítások")}
+          </Link>
+          <form method="post" action="/api/auth/logout">
+            <button className="btn btn-soft" type="submit">
+              {tr("Kilépés")}
+            </button>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}

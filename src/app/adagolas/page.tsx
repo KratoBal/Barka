@@ -1,0 +1,196 @@
+import { ChemistryCalculator } from "@/components/ChemistryCalculator";
+import { InactiveListFilter, InactiveRowShell } from "@/components/InactiveListFilter";
+import { ChemicalActive, ChemicalEdit, DosingEdit, DosingForm, MovementForm, NewChemical, type ChemicalOpt } from "@/components/DosingForms";
+import { InvalidateButton } from "@/components/FeedingForms";
+import { Shell } from "@/components/Shell";
+import { waterHelper } from "@/lib/helpers";
+import { chemistryCalcPools } from "@/lib/chemistry-calc";
+import { prisma } from "@/lib/db";
+import { dosingLog, stockLevels } from "@/lib/dosing";
+import { AppError } from "@/lib/errors";
+import { moduleLevel, pickValid } from "@/lib/master";
+import { pageTr } from "@/lib/i18n/server";
+import { requireModuleRead } from "@/lib/session";
+import { addDays, businessDayOf, formatDay, formatPeriod, isValidDay, localDateTimeOf, localTimeOf } from "@/lib/time";
+import { poolInUse } from "@/lib/pool-periods";
+
+export const dynamic = "force-dynamic";
+
+const num = (v: number) => String(v).replace(".", ",");
+
+// ADA-01..ADA-06, JAV-09: dosing by pool, the log (filterable, printable as PDF: ADA-04), the stock.
+export default async function DosingPage({ searchParams }: { searchParams: Promise<{ tol?: string; ig?: string; medence?: string; szer?: string }> }) {
+  const { user, level } = await requireModuleRead("DOSING");
+  const { tr } = await pageTr(user);
+  const sp = await searchParams;
+  const today = businessDayOf(new Date());
+  const to = sp.ig && isValidDay(sp.ig) ? sp.ig : today;
+  const from = sp.tol && isValidDay(sp.tol) ? sp.tol : addDays(to, -6);
+  const uuid = /^[0-9a-f-]{36}$/;
+  const poolId = sp.medence && uuid.test(sp.medence) ? sp.medence : null;
+  const chemicalId = sp.szer && uuid.test(sp.szer) ? sp.szer : null;
+  const now = new Date();
+  const [pools, stock, units, calcPools, exportLevel] = await Promise.all([
+    prisma.pool.findMany({ where: poolInUse(today), include: { names: true }, orderBy: { code: "asc" } }),
+    stockLevels(now),
+    prisma.unit.findMany({ where: { active: true, dimension: { in: ["MASS", "VOLUME", "COUNT"] } }, orderBy: { symbol: "asc" } }),
+    chemistryCalcPools(now, tr),
+    moduleLevel(prisma, user.id, user.role, "EXPORT"),
+  ]);
+  let log: Awaited<ReturnType<typeof dosingLog>> = [];
+  let error: string | null = null;
+  try {
+    log = await dosingLog({ from, to, poolId, chemicalId });
+  } catch (e) {
+    if (!(e instanceof AppError)) throw e;
+    error = e.message;
+  }
+  const poolOpts = pools.map((p) => ({ id: p.id, name: pickValid(p.names, now)?.displayName ?? p.code }));
+  const chemOpts: ChemicalOpt[] = stock
+    .filter((c) => c.active)
+    .map((c) => ({ id: c.id, name: c.name, units: units.filter((u) => u.dimension === c.dimension).map((u) => ({ id: u.id, symbol: u.symbol })) }));
+  const canRecord = level === "RECORD" || level === "ADMIN";
+  const isAdmin = level === "ADMIN";
+  return (
+    <Shell title={tr("Vegyszeradagolás")} active="dosing" user={user} helper={(await moduleLevel(prisma, user.id, user.role, "WATER")) !== "NONE" ? await waterHelper(true, new Date(), tr) : null}>
+      {canRecord && (
+        <div className="card no-print">
+          <h2>{tr("Adagolás")}</h2>
+          <p className="hint">{tr("Mentés után az űrlap marad: a következő adagolás a nap újabb sora (ADA-03). A szer a saját egységének dimenziójában adagolható.")}</p>
+          <DosingForm pools={poolOpts} chemicals={chemOpts} />
+        </div>
+      )}
+      {/* caparium-hibak-3: a calculation, saves nothing; open to everyone who sees the dosing page */}
+      <div className="card no-print">
+        <h2>{tr("Vegyszer-kalkulátor")}</h2>
+        <p className="hint">
+          {tr("Tiszta vegyszerekre: a szükséges mennyiség a kémiai képletből és a medence térfogatából. A javasolt értékek a medence legutóbbi méréséből és célsávjából jönnek, mind átírható. Nem ment semmit.")}
+        </p>
+        <ChemistryCalculator pools={calcPools} />
+      </div>
+      <div className="card">
+        <h2>{tr("Napló")}</h2>
+        <form method="get" action="/adagolas" className="filters no-print">
+          <label className="field">
+            {tr("Naptól")}
+            <input className="input" type="date" name="tol" defaultValue={from} />
+          </label>
+          <label className="field">
+            {tr("Napig")}
+            <input className="input" type="date" name="ig" defaultValue={to} />
+          </label>
+          <label className="field">
+            {tr("Medence")}
+            <select className="input" name="medence" defaultValue={poolId ?? ""} aria-label={tr("Szűrés medencére")}>
+              <option value="">{tr("mind")}</option>
+              {poolOpts.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            {tr("Szer")}
+            <select className="input" name="szer" defaultValue={chemicalId ?? ""} aria-label={tr("Szűrés szerre")}>
+              <option value="">{tr("mind")}</option>
+              {stock.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="btn btn-soft" type="submit">{tr("Lekérés")}</button>
+        </form>
+        {/* Lili 2026-11-01 (point 5): the log as a PDF made on the server, in the other PDFs' style (the browser's print is gone) */}
+        {exportLevel !== "NONE" && (
+          <form method="post" action="/api/exports/dosing" className="toolbar no-print">
+            <input type="hidden" name="from" value={from} />
+            <input type="hidden" name="to" value={to} />
+            {poolId && <input type="hidden" name="pool" value={poolId} />}
+            {chemicalId && <input type="hidden" name="chemical" value={chemicalId} />}
+            <button className="btn btn-soft" type="submit" data-testid="pdf-adagolas">
+              {tr("Napló PDF-ben ({period})", { period: formatPeriod(from, to) })}
+            </button>
+          </form>
+        )}
+        {error && <div className="banner banner-error">{error}</div>}
+        <div className="table-scroll">
+          <table className="log-table" data-testid="dosing-log">
+            <thead>
+              <tr><th>{tr("Nap")}</th><th>{tr("Idő")}</th><th>{tr("Medence")}</th><th>{tr("Szer")}</th><th>{tr("Mennyiség")}</th><th>{tr("Végezte")}</th><th></th></tr>
+            </thead>
+            <tbody>
+              {log.map((r) => (
+                <tr key={r.id} className={r.status === "VALID" ? undefined : "invalid"}>
+                  <td>{formatDay(r.day)}</td>
+                  <td>{localTimeOf(r.at)}</td>
+                  <td>{r.pool}</td>
+                  <td>{r.chemical}</td>
+                  <td>
+                    {r.quantity.replace(".", ",")} {r.unit}
+                  </td>
+                  <td>{r.by}</td>
+                  <td className="keep no-print">
+                    {r.status === "VALID" ? canRecord && (
+                      <>
+                        <DosingEdit
+                          row={{ id: r.id, version: r.version, atLocal: localDateTimeOf(r.at), poolId: r.poolId, chemicalId: r.chemicalId, quantity: r.quantity, unitId: r.unitId }}
+                          pools={poolOpts}
+                          chemicals={chemOpts}
+                        />{" "}
+                        <InvalidateButton url={`/api/dosings/${r.id}/invalidate`} version={r.version} />
+                      </>
+                    ) : `${tr("érvénytelenítve")}${r.invalidationReason ? `: ${r.invalidationReason}` : ""}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div className="card">
+        <h2>{tr("Készlet")}</h2>
+        <p className="hint">{tr("A készlet a mozgások összege; kezdőkészlet nélkül negatív lehet, ez jelzés, nem hiba. Bevételezést és leltárkorrekciót adminisztrátor rögzít.")}</p>
+        {/* Lili 2026-10-29 (package item 16): an inactive chemical behind "Inaktívak mutatása", as the feeds; its dosings stay */}
+        <InactiveListFilter inactive={stock.filter((c) => !c.active).length}>
+        <table className="log-table" data-testid="stock">
+          <thead>
+            <tr><th>{tr("Szer")}</th><th>{tr("Készlet")}</th><th>{tr("Fogyás, 7 nap")}</th><th>{tr("Fogyás, 30 nap")}</th>{isAdmin && <th className="no-print" />}</tr>
+          </thead>
+          <tbody>
+            {stock.map((c) => (
+              <InactiveRowShell key={c.id} id={c.id} active={c.active}>
+                <td>{c.name}</td>
+                <td className="keep">
+                  <span className={c.negative ? "badge badge-invalid" : undefined}>
+                    {num(c.level)} {c.unit}
+                  </span>
+                </td>
+                <td>
+                  {num(c.week)} {c.unit}
+                </td>
+                <td>
+                  {num(c.month)} {c.unit}
+                </td>
+                {isAdmin && (
+                  <td className="keep no-print">
+                    <ChemicalEdit chem={c} units={units.map((u) => ({ id: u.id, name: u.symbol }))} /> <ChemicalActive chem={c} />
+                  </td>
+                )}
+              </InactiveRowShell>
+            ))}
+          </tbody>
+        </table>
+        </InactiveListFilter>
+        {isAdmin && (
+          <div className="no-print">
+            <MovementForm chemicals={chemOpts} />
+            <NewChemical units={units.map((u) => ({ id: u.id, name: u.symbol }))} />
+          </div>
+        )}
+      </div>
+    </Shell>
+  );
+}

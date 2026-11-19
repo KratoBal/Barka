@@ -1,0 +1,1550 @@
+// Cápárium nAPPló database schema.
+// Source of the rules: caparium-adatmodell-v1.md (areas 0-5, 14-15 for the first stage).
+// Area numbers in comments refer to that document; K1..K9 are its common rules.
+// Constraints Prisma cannot express (partial unique indexes, append-only audit)
+// live in the migration SQL, see prisma/migrations/*/migration.sql.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Area 1: users and permissions
+// ---------------------------------------------------------------------------
+
+enum Role {
+  AQUARIST
+  ADMIN
+  SYSTEM // the non-login actor of automatic operations (R-12)
+}
+
+enum AppModule {
+  WATER
+  FEEDING
+  WITHDRAWAL
+  DOSING
+  SETTINGS
+  EXPORT
+}
+
+// The language the screens speak (Lili 2026-11-17): the user's default; the header's switch overrides it per device
+enum UiLanguage {
+  HU
+  EN
+}
+
+enum PermissionLevel {
+  NONE
+  READ
+  RECORD
+  ADMIN
+}
+
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+  fullName      String
+  // Lili 2026-11-01 (point 17): what the helper calls the user in its greeting, set by the user; empty = the given name of fullName
+  nickname      String?
+  // Lili 2026-11-17 (task t-20261117-caparium-angol-alap): the default language of the screens; a device's own choice (the
+  // header's HU/EN switch, a cookie) wins over it
+  language      UiLanguage @default(HU)
+  loginId       String    @unique
+  // task e7f9e84d: optional, the user's own (or set by an admin); trimmed and lower-case; the password reset's address
+  email         String?   @unique
+  passwordHash  String?
+  role          Role
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  deactivatedAt DateTime? @db.Timestamptz(3)
+
+  monograms         UserMonogram[]
+  zimsNames         UserZimsName[]
+  modulePermissions ModulePermission[]
+  dosingsPerformed  Dosing[]
+  sessions          Session[]
+  passwordResets    PasswordReset[]
+
+  @@map("app_user")
+}
+
+// K3: time-versioned monogram, the single source of the monogram (R-13).
+model UserMonogram {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  monogram  String
+  validFrom DateTime  @db.Timestamptz(3)
+  validTo   DateTime? @db.Timestamptz(3)
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, validFrom])
+  @@map("user_monogram")
+}
+
+// K3: ZIMS display name of the worker, letter by letter from the customer table (DN-06).
+model UserZimsName {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  zimsName  String
+  validFrom DateTime  @db.Timestamptz(3)
+  validTo   DateTime? @db.Timestamptz(3)
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, validFrom])
+  @@map("user_zims_name")
+}
+
+// ÁLT-04 "later": the structure exists now, the UI comes in stage 4.
+// If a row exists it overrides the role default in that module, both ways (R-17).
+model ModulePermission {
+  id     String          @id @default(uuid()) @db.Uuid
+  userId String          @db.Uuid
+  module AppModule
+  level  PermissionLevel
+  user   User            @relation(fields: [userId], references: [id])
+
+  @@unique([userId, module])
+  @@map("module_permission")
+}
+
+// A one-time password reset link (task e7f9e84d). Like a session, only the sha256 of the random token is stored; the raw token
+// is in the link and nowhere else. Used once (usedAt), and only before expiresAt.
+model PasswordReset {
+  id          String    @id
+  userId      String    @db.Uuid
+  /** the admin who made the link; null for a link the user asked for by e-mail */
+  createdById String?   @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  expiresAt   DateTime  @db.Timestamptz(3)
+  usedAt      DateTime? @db.Timestamptz(3)
+  user        User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("password_reset")
+}
+
+model Session {
+  // sha256 of the random token; the raw token lives only in the cookie
+  id         String   @id
+  userId     String   @db.Uuid
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  expiresAt  DateTime @db.Timestamptz(3)
+  lastSeenAt DateTime @default(now()) @db.Timestamptz(3)
+  user       User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("session")
+}
+
+// ---------------------------------------------------------------------------
+// Area 2: pools (medencék) with changing names
+// ---------------------------------------------------------------------------
+
+model Pool {
+  id           String          @id @default(uuid()) @db.Uuid
+  code         String          @unique // internal, never shown as a key to users
+  emoji        String?
+  // the fixed order of the pools in the water report PDF (Lili 2026-10-26, Caparium channel msg 1564418747047874581): the first
+  // values are Nagymedence, Karantén, Kismedence, Ragadozós, Korallos, Inkubátor, then the salt pools; a new pool takes the next
+  // number, at the end. null = never placed (after the placed ones, in the order they were created).
+  sortOrder    Int?
+  // caparium-hibak-3: the pool's volume in litres, the chemical calculator works with it; null = not given yet
+  volumeLiters Decimal?        @db.Decimal(14, 4)
+  // Lili 2026-10-29 (package item 5b): a coral or a fish system; the chemical calculator's daily limit follows it (Balázs's
+  // decision, 18:59 UTC). null = not set yet: the calculator then asks, it does not guess
+  systemType   PoolSystemType?
+  active       Boolean         @default(true)
+  createdAt    DateTime        @default(now()) @db.Timestamptz(3)
+  closedAt     DateTime?       @db.Timestamptz(3)
+
+  names        PoolName[]
+  memberships  GroupMembership[]
+  measurements Measurement[]
+  placements   Placement[]
+  arrivals     LifecycleEvent[]
+  dosings      Dosing[]
+  references   ReferenceRange[]
+  ticks        PoolTick[]
+  periods      PoolPeriod[]
+
+  @@map("pool")
+}
+
+// Lili 2026-11-01 (point 16): the days a pool is in use, one or more periods (from a day, to a day or open, both inclusive, business
+// days), as the feeds' (point 14). A renovation is a gap between two periods; the pool, its measurements and its animals stay the
+// same. Every list of a day (the grid, a measurement, a dosing, an animal's placement) takes the pools in use that day; a closed
+// period takes the place of "inactive" (Pool.active follows today's state). The migration gave the active pools an open period from
+// 2018-12-07 and the inactive ones a period ending the day before they were switched off.
+model PoolPeriod {
+  id          String    @id @default(uuid()) @db.Uuid
+  poolId      String    @db.Uuid
+  firstDay    DateTime  @db.Date
+  lastDay     DateTime? @db.Date
+  createdById String    @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  pool        Pool      @relation(fields: [poolId], references: [id])
+
+  @@index([poolId, firstDay])
+  @@map("pool_period")
+}
+
+model PoolName {
+  id          String    @id @default(uuid()) @db.Uuid
+  poolId      String    @db.Uuid
+  displayName String
+  validFrom   DateTime  @db.Timestamptz(3)
+  validTo     DateTime? @db.Timestamptz(3)
+  pool        Pool      @relation(fields: [poolId], references: [id])
+
+  @@index([poolId, validFrom])
+  @@map("pool_name")
+}
+
+enum PoolSystemType {
+  CORAL
+  FISH
+}
+
+enum Frequency {
+  DAILY
+  WEEKLY
+}
+
+model MeasurementGroup {
+  id        String    @id @default(uuid()) @db.Uuid
+  code      String    @unique
+  name      String
+  frequency Frequency
+  sortOrder Int
+  active    Boolean   @default(true)
+
+  memberships GroupMembership[]
+  parameters  GroupParameter[]
+  rounds      MeasurementRound[]
+  journalDays JournalDay[]
+
+  @@map("measurement_group")
+}
+
+model GroupMembership {
+  id        String           @id @default(uuid()) @db.Uuid
+  groupId   String           @db.Uuid
+  poolId    String           @db.Uuid
+  sortOrder Int
+  validFrom DateTime         @db.Timestamptz(3)
+  validTo   DateTime?        @db.Timestamptz(3)
+  group     MeasurementGroup @relation(fields: [groupId], references: [id])
+  pool      Pool             @relation(fields: [poolId], references: [id])
+
+  @@index([groupId, validFrom])
+  @@map("group_membership")
+}
+
+model GroupParameter {
+  id          String           @id @default(uuid()) @db.Uuid
+  groupId     String           @db.Uuid
+  parameterId String           @db.Uuid
+  sortOrder   Int
+  // Lili 2026-11-01 (point 9, msg 1566532615530352863): a measurement started in some pools only. Empty: every pool of the group
+  // (every parameter before point 9); else only these pools fill the column, the others show a dash.
+  poolIds     String[]         @default([]) @db.Uuid
+  validFrom   DateTime         @db.Timestamptz(3)
+  validTo     DateTime?        @db.Timestamptz(3)
+  group       MeasurementGroup @relation(fields: [groupId], references: [id])
+  parameter   Parameter        @relation(fields: [parameterId], references: [id])
+
+  @@index([groupId, validFrom])
+  @@map("group_parameter")
+}
+
+// ---------------------------------------------------------------------------
+// Area 3 and part of 11: units, parameters, reference ranges
+// ---------------------------------------------------------------------------
+
+enum Dimension {
+  MASS
+  COUNT
+  VOLUME
+  CONCENTRATION
+  TEMPERATURE
+  VOLTAGE
+  HARDNESS // dKH: carbonate hardness, not convertible to ppm without a chemistry rule
+  DIMENSIONLESS
+}
+
+model Unit {
+  id           String    @id @default(uuid()) @db.Uuid
+  symbol       String    @unique
+  dimension    Dimension
+  // factor to the base unit of the dimension; null = not convertible (pH)
+  factorToBase Decimal?  @db.Decimal(20, 10)
+  isBase       Boolean   @default(false)
+  active       Boolean   @default(true)
+
+  parameters           Parameter[]
+  referenceRanges      ReferenceRange[]
+  measurements         Measurement[]
+  zimsUnitNames        ZimsUnitName[]
+  feeds                Feed[]
+  coralDoses           CoralFeedDose[]
+  feedingQuantities    FeedingQuantity[]
+  withdrawalQuantities WithdrawalQuantity[]
+  intakeQuantities     FeedIntakeQuantity[]
+  chemicalStocks       Chemical[]
+  dosings              Dosing[]
+  movementsOriginal    StockMovement[]
+
+  @@map("unit")
+}
+
+model Parameter {
+  id           String   @id @default(uuid()) @db.Uuid
+  code         String   @unique
+  unitId       String   @db.Uuid
+  decimals     Int
+  // plausibility bounds (JAV-02): outside means "probably a typo", asks for confirmation; NOT the reference
+  plausibleMin Decimal? @db.Decimal(14, 4)
+  plausibleMax Decimal? @db.Decimal(14, 4)
+  active       Boolean  @default(true)
+  sortOrder    Int
+  // Lili 2026-11-02 (acrobot 39956, 39960): a unit change closes a measurement type and starts its successor with the same
+  // name and tables; the successor points back here, and the list shows the two together
+  predecessorId String?  @unique @db.Uuid
+  // the built-in code whose behaviour a successor keeps (the NO3 and PO4 dilution, src/lib/dilution.ts); null: its own code
+  baseCode      String?
+
+  unit            Unit                  @relation(fields: [unitId], references: [id])
+  predecessor     Parameter?            @relation("ParameterSuccession", fields: [predecessorId], references: [id], onDelete: Restrict)
+  successor       Parameter?            @relation("ParameterSuccession")
+  names           ParameterName[]
+  referenceRanges ReferenceRange[]
+  groups          GroupParameter[]
+  measurements    Measurement[]
+  zimsNames       ZimsParameterName[]
+  zimsUnitNames   ZimsUnitName[]
+  conversions     ParameterConversion[]
+
+  @@map("parameter")
+}
+
+// Lili 2026-11-01 (point 13): a tester whose reading is not the value itself (Hanna HI755: reading x 0.056 = dKH; HI736:
+// reading x 0.003066 = ppm PO4). From validFrom on, what is typed in the grid for this parameter is the reading: the value is
+// reading x factor, rounded to `decimals`, and the reading is kept on the measurement (rawReading). One in force at a time.
+model ParameterConversion {
+  id          String    @id @default(uuid()) @db.Uuid
+  parameterId String    @db.Uuid
+  label       String
+  factor      Decimal   @db.Decimal(20, 10)
+  decimals    Int
+  validFrom   DateTime  @db.Timestamptz(3)
+  validTo     DateTime? @db.Timestamptz(3)
+  createdById String    @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  parameter    Parameter     @relation(fields: [parameterId], references: [id])
+  measurements Measurement[]
+
+  @@index([parameterId, validFrom])
+  @@map("parameter_conversion")
+}
+
+model ParameterName {
+  id          String    @id @default(uuid()) @db.Uuid
+  parameterId String    @db.Uuid
+  displayName String
+  validFrom   DateTime  @db.Timestamptz(3)
+  validTo     DateTime? @db.Timestamptz(3)
+  parameter   Parameter @relation(fields: [parameterId], references: [id])
+
+  @@index([parameterId, validFrom])
+  @@map("parameter_name")
+}
+
+// DN-08: per parameter, not per pool.
+// caparium-hibak-3: a range is a pool's own (poolId) or the common one every pool starts from (poolId null);
+// the pool's own valid range wins, else the common one (src/lib/master.ts referenceAt)
+model ReferenceRange {
+  id          String    @id @default(uuid()) @db.Uuid
+  parameterId String    @db.Uuid
+  poolId      String?   @db.Uuid
+  min         Decimal?  @db.Decimal(14, 4)
+  max         Decimal?  @db.Decimal(14, 4)
+  unitId      String    @db.Uuid
+  validFrom   DateTime  @db.Timestamptz(3)
+  validTo     DateTime? @db.Timestamptz(3)
+  createdById String    @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+
+  parameter    Parameter     @relation(fields: [parameterId], references: [id])
+  pool         Pool?         @relation(fields: [poolId], references: [id], onDelete: Restrict)
+  unit         Unit          @relation(fields: [unitId], references: [id])
+  measurements Measurement[]
+
+  @@index([parameterId, validFrom])
+  @@index([parameterId, poolId, validFrom])
+  @@map("reference_range")
+}
+
+// ---------------------------------------------------------------------------
+// Area 4: measurements
+// ---------------------------------------------------------------------------
+
+enum RecordStatus {
+  VALID
+  INVALIDATED
+  PENDING // arrived after the grace period (K9), waits for an admin decision
+}
+
+enum DiluentWater {
+  RO
+  SW
+}
+
+// T-07: one sheet of a group on a business day; "Új mérés ma" opens the next round.
+model MeasurementRound {
+  id          String           @id @default(uuid()) @db.Uuid
+  groupId     String           @db.Uuid
+  businessDay DateTime         @db.Date
+  seq         Int
+  createdById String           @db.Uuid
+  createdAt   DateTime         @default(now()) @db.Timestamptz(3)
+  group       MeasurementGroup @relation(fields: [groupId], references: [id])
+
+  measurements Measurement[]
+
+  @@unique([groupId, businessDay, seq])
+  @@map("measurement_round")
+}
+
+// Lili 2026-10-29 (Caparium channel msg 1565439824826077305 and 1565439885244895296; task caparium-lili-nagyobb-m, item 8):
+// on the daily water measurement a small tick under the pool's name says that the pool was backwashed or topped up
+// (the big pools, group NAPI_NAGY) or had a water change (the small tanks, group NAPI_KIS). A fact of the pool and the
+// business day, not of a measurement, and it never reaches the ZIMS export. A row exists while the tick is on; unticking
+// deletes it (the audit entry keeps who ticked and unticked).
+enum PoolTickKind {
+  BACKWASH
+  TOPUP
+  WATER_CHANGE
+  // Lili 2026-11-01 23:30 UTC: the Nagymedence's three sand filters; its BACKWASH is the first (HSZ1)
+  BACKWASH_2
+  BACKWASH_3
+}
+
+model PoolTick {
+  poolId      String       @db.Uuid
+  businessDay DateTime     @db.Date
+  kind        PoolTickKind
+  createdById String       @db.Uuid
+  createdAt   DateTime     @default(now()) @db.Timestamptz(3)
+  pool        Pool         @relation(fields: [poolId], references: [id])
+
+  @@id([poolId, businessDay, kind])
+  @@map("pool_tick")
+}
+
+model Measurement {
+  id                 String        @id @default(uuid()) @db.Uuid
+  roundId            String        @db.Uuid
+  poolId             String        @db.Uuid
+  parameterId        String        @db.Uuid
+  value              Decimal       @db.Decimal(14, 4)
+  unitId             String        @db.Uuid // K4 snapshot
+  measuredAt         DateTime      @db.Timestamptz(3)
+  businessDay        DateTime      @db.Date
+  dilution           Int?
+  diluentWater       DiluentWater?
+  responsibleUserId  String        @db.Uuid
+  traineePerformed   Boolean       @default(false)
+  referenceRangeId   String?       @db.Uuid
+  // point 13: the tester's reading the value was converted from, and the conversion used (both null: typed directly)
+  rawReading         Decimal?      @db.Decimal(14, 4)
+  // Lili 2026-11-01 22:35 UTC: the value before the weekly dilution (the reading, or the tester's converted value); value = baseValue x
+  // dilution. Null: no dilution, or a row saved before the dilution was a factor (its dilution was a note then)
+  baseValue          Decimal?      @db.Decimal(14, 4)
+  conversionId       String?       @db.Uuid
+  // K5
+  version            Int           @default(1)
+  requestId          String        @unique
+  status             RecordStatus  @default(VALID)
+  invalidationReason String?
+  createdById        String        @db.Uuid
+  createdAt          DateTime      @default(now()) @db.Timestamptz(3)
+  clientTimestamp    DateTime?     @db.Timestamptz(3)
+  updatedById        String        @db.Uuid
+  updatedAt          DateTime      @default(now()) @db.Timestamptz(3)
+
+  round          MeasurementRound     @relation(fields: [roundId], references: [id])
+  pool           Pool                 @relation(fields: [poolId], references: [id])
+  parameter      Parameter            @relation(fields: [parameterId], references: [id])
+  unit           Unit                 @relation(fields: [unitId], references: [id])
+  referenceRange ReferenceRange?      @relation(fields: [referenceRangeId], references: [id])
+  conversion     ParameterConversion? @relation(fields: [conversionId], references: [id], onDelete: Restrict)
+  exportItems    ExportItem[]
+
+  // the "one valid value per cell" partial unique index is in the migration SQL
+  @@index([businessDay, poolId])
+  @@index([roundId])
+  @@map("measurement")
+}
+
+// ---------------------------------------------------------------------------
+// Area 5: ZIMS mapping (data, not code; letter by letter from the customer table)
+// ---------------------------------------------------------------------------
+
+model ZimsParameterName {
+  id          String    @id @default(uuid()) @db.Uuid
+  parameterId String    @db.Uuid
+  zimsName    String
+  validFrom   DateTime  @db.Timestamptz(3)
+  validTo     DateTime? @db.Timestamptz(3)
+  parameter   Parameter @relation(fields: [parameterId], references: [id])
+
+  @@index([parameterId, validFrom])
+  @@map("zims_parameter_name")
+}
+
+model ZimsUnitName {
+  id          String     @id @default(uuid()) @db.Uuid
+  unitId      String     @db.Uuid
+  parameterId String?    @db.Uuid // a parameter-specific row beats the generic one
+  zimsUnit    String
+  validFrom   DateTime   @db.Timestamptz(3)
+  validTo     DateTime?  @db.Timestamptz(3)
+  unit        Unit       @relation(fields: [unitId], references: [id])
+  parameter   Parameter? @relation(fields: [parameterId], references: [id])
+
+  @@index([unitId, validFrom])
+  @@map("zims_unit_name")
+}
+
+model ZimsExportProfile {
+  id                String   @id @default(uuid()) @db.Uuid
+  version           Int      @unique
+  datePattern       String
+  timePattern       String
+  decimalSeparator  String
+  fieldSeparator    String
+  lineEnding        String
+  encoding          String
+  header            String
+  allRowsFilled     Boolean
+  timeZone          String
+  active            Boolean  @default(false)
+  validFrom         DateTime @db.Timestamptz(3)
+  approvedByTrialId String?  @db.Uuid
+
+  trialImports ZimsTrialImport[] @relation("trialProfile")
+  exportRuns   ExportRun[]
+
+  @@map("zims_export_profile")
+}
+
+enum TrialResult {
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+model ZimsTrialImport {
+  id          String            @id @default(uuid()) @db.Uuid
+  date        DateTime          @db.Date
+  profileId   String            @db.Uuid
+  exportRunId String?           @db.Uuid
+  result      TrialResult
+  deviations  String?
+  checkedBy   String
+  createdById String            @db.Uuid
+  createdAt   DateTime          @default(now()) @db.Timestamptz(3)
+  profile     ZimsExportProfile @relation("trialProfile", fields: [profileId], references: [id])
+
+  @@map("zims_trial_import")
+}
+
+// ---------------------------------------------------------------------------
+// Area 14: journal days, reopening, audit
+// ---------------------------------------------------------------------------
+
+enum JournalKind {
+  WATER
+  FEEDING
+  WITHDRAWAL
+  DOSING
+}
+
+enum JournalDayState {
+  OPEN
+  CLOSED
+}
+
+enum CloseMode {
+  MANUAL
+  AUTOMATIC
+}
+
+// The single lock of a day (R-4). Unique (kind, group, day) with NULLS NOT DISTINCT is in the migration SQL.
+model JournalDay {
+  id          String            @id @default(uuid()) @db.Uuid
+  kind        JournalKind
+  groupId     String?           @db.Uuid
+  businessDay DateTime          @db.Date
+  state       JournalDayState   @default(OPEN)
+  closeMode   CloseMode?
+  closedById  String?           @db.Uuid
+  closedAt    DateTime?         @db.Timestamptz(3) // planned close time for automatic closing
+  closeRanAt  DateTime?         @db.Timestamptz(3) // when it actually ran
+  group       MeasurementGroup? @relation(fields: [groupId], references: [id])
+
+  reopenings    JournalReopen[]
+  feedingDay    FeedingDay?
+  withdrawalDay WithdrawalDay?
+
+  @@index([businessDay])
+  @@map("journal_day")
+}
+
+model JournalReopen {
+  id           String     @id @default(uuid()) @db.Uuid
+  journalDayId String     @db.Uuid
+  reopenedById String     @db.Uuid
+  at           DateTime   @default(now()) @db.Timestamptz(3)
+  /// null when the reasons are off (src/lib/reasons.ts); the reasons given before stay
+  reason       String?
+  reclosedAt   DateTime?  @db.Timestamptz(3)
+  journalDay   JournalDay @relation(fields: [journalDayId], references: [id])
+
+  @@map("journal_reopen")
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  INVALIDATE
+  CLOSE
+  REOPEN
+  MASTER_CHANGE
+  MASTER_CORRECTION
+  EXPORT
+  LOGIN
+  LOGIN_FAILED
+  LOGOUT
+  CONFLICT_REJECTED
+  PENDING_CREATED
+  PENDING_APPROVED
+  PENDING_REJECTED
+  ANONYMIZE
+}
+
+// K6: append-only. UPDATE, DELETE and TRUNCATE are rejected by triggers (migration SQL).
+model AuditEntry {
+  id              BigInt      @id @default(autoincrement())
+  at              DateTime    @default(now()) @db.Timestamptz(3)
+  userId          String      @db.Uuid
+  action          AuditAction
+  entityType      String
+  entityId        String
+  changes         Json        @default("{}")
+  reason          String?
+  requestId       String?
+  client          String?
+  clientTimestamp DateTime?   @db.Timestamptz(3)
+
+  @@index([entityType, entityId])
+  @@index([at])
+  @@index([requestId])
+  @@map("audit_entry")
+}
+
+// ---------------------------------------------------------------------------
+// Area 15: exports (used from stage 3; the structure is here so later stages add no rework)
+// ---------------------------------------------------------------------------
+
+enum ExportKind {
+  ZIMS_CSV
+  EXCEL_WATER
+  PDF_WATER
+  EXCEL_FEEDING
+  EXCEL_EATING
+  EXCEL_WITHDRAWAL
+  EXCEL_INTAKE
+  PDF_INTAKE
+  PDF_DOSING
+  PDF_REPORT
+  EXCEL_FRIDGE
+  PDF_FRIDGE
+}
+
+enum ExportPurpose {
+  SUBMISSION
+  TRIAL
+  PREVIEW
+}
+
+enum SubmissionState {
+  CREATED
+  SUBMITTED
+  REJECTED
+}
+
+model ExportRun {
+  id                String             @id @default(uuid()) @db.Uuid
+  kind              ExportKind
+  purpose           ExportPurpose
+  periodFrom        DateTime           @db.Date
+  periodTo          DateTime           @db.Date
+  filters           Json               @default("{}")
+  zimsProfileId     String?            @db.Uuid
+  templateVersionId String?            @db.Uuid
+  createdById       String             @db.Uuid
+  createdAt         DateTime           @default(now()) @db.Timestamptz(3)
+  submissionState   SubmissionState?
+  submittedById     String?            @db.Uuid
+  submittedAt       DateTime?          @db.Timestamptz(3)
+  // warnings of the run (e.g. a measurement in the repeated autumn hour, R-18)
+  warnings          Json               @default("[]")
+  zimsProfile       ZimsExportProfile? @relation(fields: [zimsProfileId], references: [id])
+  templateVersion   TemplateVersion?   @relation(fields: [templateVersionId], references: [id])
+
+  files ExportFile[]
+  items ExportItem[]
+
+  @@map("export_run")
+}
+
+model ExportFile {
+  id          String    @id @default(uuid()) @db.Uuid
+  exportRunId String    @db.Uuid
+  fileName    String
+  sha256      String
+  rowCount    Int
+  // the exact bytes handed out (CSV); kept so a submitted file can be downloaded again unchanged
+  content     String?
+  poolId      String?   @db.Uuid
+  exportRun   ExportRun @relation(fields: [exportRunId], references: [id])
+
+  @@map("export_file")
+}
+
+model ExportItem {
+  id                 String      @id @default(uuid()) @db.Uuid
+  exportRunId        String      @db.Uuid
+  measurementId      String      @db.Uuid
+  measurementVersion Int
+  rowSha256          String
+  exportRun          ExportRun   @relation(fields: [exportRunId], references: [id])
+  measurement        Measurement @relation(fields: [measurementId], references: [id])
+
+  @@index([measurementId])
+  @@map("export_item")
+}
+
+model TemplateVersion {
+  id           String      @id @default(uuid()) @db.Uuid
+  templateKind String
+  version      Int
+  sha256       String
+  validFrom    DateTime    @db.Timestamptz(3)
+  exportRuns   ExportRun[]
+
+  @@unique([templateKind, version])
+  @@map("template_version")
+}
+
+// ---------------------------------------------------------------------------
+// Area 16: settings (time-versioned key/value)
+// ---------------------------------------------------------------------------
+
+model Setting {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String
+  value       String
+  validFrom   DateTime @default(now()) @db.Timestamptz(3)
+  changedById String   @db.Uuid
+
+  @@index([key, validFrom])
+  @@map("setting")
+}
+
+// ---------------------------------------------------------------------------
+// Areas 6, 7, 11 (stage 2): animals, groups, lifecycle, feeds
+// ---------------------------------------------------------------------------
+
+enum Sex {
+  MALE
+  FEMALE
+  UNKNOWN
+}
+
+model Species {
+  id             String   @id @default(uuid()) @db.Uuid
+  scientificName String
+  hungarianName  String?
+  synonyms       String?
+  active         Boolean  @default(true)
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  animals        Animal[]
+
+  @@map("species")
+}
+
+// DN-04: every animal is an individual with its own id, also inside a group
+model Animal {
+  id         String   @id @default(uuid()) @db.Uuid
+  speciesId  String   @db.Uuid
+  sex        Sex      @default(UNKNOWN)
+  note       String?
+  // the admin's own order of the animals (Lili 2026-10-26, card f67b1a06 item 4): lists and exports follow it,
+  // an animal never placed (null) comes after the placed ones, by name
+  sortOrder  Int?
+  // the row's background on the feeding sheet, a key of sheet-color-palette.ts; display only, none by default
+  sheetColor String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  species        Species                 @relation(fields: [speciesId], references: [id])
+  names          AnimalName[]
+  events         LifecycleEvent[]
+  placements     Placement[]
+  memberships    AnimalGroupMembership[]
+  selections     FeedingSelection[]
+  feedingItems   FeedingItem[]
+  participations FeedingParticipant[]
+  eatingStatuses EatingStatus[]
+  bodyWeights    BodyWeight[]
+  calculatorRuns CalculatorRun[]
+  references     FeedingReference[]
+  feedingPlans   FeedingPlan[]
+  listMembers    FeedingListAnimal[]
+
+  @@map("animal")
+}
+
+model AnimalName {
+  id        String    @id @default(uuid()) @db.Uuid
+  animalId  String    @db.Uuid
+  name      String
+  validFrom DateTime  @db.Timestamptz(3)
+  validTo   DateTime? @db.Timestamptz(3)
+  animal    Animal    @relation(fields: [animalId], references: [id])
+
+  @@index([animalId, validFrom])
+  @@map("animal_name")
+}
+
+// a feeding unit ("Ráják"); it has no pool of its own: its members' placements decide
+model AnimalGroup {
+  id           String                  @id @default(uuid()) @db.Uuid
+  active       Boolean                 @default(true)
+  // as Animal.sheetColor: the group's row on the feeding sheet
+  sheetColor   String?
+  createdAt    DateTime                @default(now()) @db.Timestamptz(3)
+  names        AnimalGroupName[]
+  memberships  AnimalGroupMembership[]
+  events       LifecycleEvent[]
+  feedingItems FeedingItem[]
+  references   FeedingReference[]
+
+  @@map("animal_group")
+}
+
+model AnimalGroupName {
+  id        String      @id @default(uuid()) @db.Uuid
+  groupId   String      @db.Uuid
+  name      String
+  validFrom DateTime    @db.Timestamptz(3)
+  validTo   DateTime?   @db.Timestamptz(3)
+  group     AnimalGroup @relation(fields: [groupId], references: [id])
+
+  @@index([groupId, validFrom])
+  @@map("animal_group_name")
+}
+
+enum LifecycleType {
+  ARRIVAL
+  TRANSFER
+  GROUP_CHANGE
+  DEATH
+  RELEASE
+}
+
+// T-09, DAT-05: dated events; placements and memberships are DERIVED from the valid ones
+model LifecycleEvent {
+  id                 String        @id @default(uuid()) @db.Uuid
+  animalId           String        @db.Uuid
+  type               LifecycleType
+  occurredAt         DateTime      @db.Timestamptz(3)
+  businessDay        DateTime      @db.Date
+  toPoolId           String?       @db.Uuid
+  toGroupId          String?       @db.Uuid
+  note               String?
+  version            Int           @default(1)
+  requestId          String        @unique
+  status             RecordStatus  @default(VALID)
+  invalidationReason String?
+  createdById        String        @db.Uuid
+  createdAt          DateTime      @default(now()) @db.Timestamptz(3)
+  updatedById        String        @db.Uuid
+  updatedAt          DateTime      @default(now()) @db.Timestamptz(3)
+
+  animal  Animal       @relation(fields: [animalId], references: [id])
+  toPool  Pool?        @relation(fields: [toPoolId], references: [id])
+  toGroup AnimalGroup? @relation(fields: [toGroupId], references: [id])
+
+  @@index([animalId, occurredAt])
+  @@map("lifecycle_event")
+}
+
+// derived from LifecycleEvent (never edited by hand); rebuilt per animal on every event change
+model Placement {
+  id        String    @id @default(uuid()) @db.Uuid
+  animalId  String    @db.Uuid
+  poolId    String    @db.Uuid
+  validFrom DateTime  @db.Timestamptz(3)
+  validTo   DateTime? @db.Timestamptz(3)
+  eventId   String    @db.Uuid
+  animal    Animal    @relation(fields: [animalId], references: [id])
+  pool      Pool      @relation(fields: [poolId], references: [id])
+
+  @@index([animalId, validFrom])
+  @@index([poolId, validFrom])
+  @@map("placement")
+}
+
+model AnimalGroupMembership {
+  id        String      @id @default(uuid()) @db.Uuid
+  animalId  String      @db.Uuid
+  groupId   String      @db.Uuid
+  validFrom DateTime    @db.Timestamptz(3)
+  validTo   DateTime?   @db.Timestamptz(3)
+  eventId   String      @db.Uuid
+  animal    Animal      @relation(fields: [animalId], references: [id])
+  group     AnimalGroup @relation(fields: [groupId], references: [id])
+
+  @@index([animalId, validFrom])
+  @@index([groupId, validFrom])
+  @@map("animal_group_membership")
+}
+
+model FeedType {
+  id        String  @id @default(uuid()) @db.Uuid
+  code      String  @unique
+  name      String
+  sortOrder Int
+  emoji     String?
+  feeds     Feed[]
+
+  @@map("feed_type")
+}
+
+model Feed {
+  id                String      @id @default(uuid()) @db.Uuid
+  typeId            String      @db.Uuid
+  // T-08: the dimensions a quantity of this feed may have (Litopenaeus: MASS and COUNT)
+  allowedDimensions Dimension[]
+  defaultUnitId     String      @db.Uuid
+  temporary         Boolean     @default(false)
+  active            Boolean     @default(true)
+  // 6fe63c9b item 7 (the coral feeds, until the zoo decides on a dose): the feeding sheet shows a tick (given or
+  // not), and an item of this feed may have no quantity; the item form still takes one
+  sheetTick         Boolean     @default(false)
+  sortOrder         Int
+  createdAt         DateTime    @default(now()) @db.Timestamptz(3)
+
+  type        FeedType          @relation(fields: [typeId], references: [id])
+  defaultUnit Unit              @relation(fields: [defaultUnitId], references: [id])
+  names       FeedName[]
+  coralDoses  CoralFeedDose[]
+  listMembers FeedingListFeed[]
+  items       FeedingItem[]
+  withdrawals WithdrawalItem[]
+  intakes     FeedIntakeItem[]
+  periods     FeedPeriod[]
+
+  @@map("feed")
+}
+
+// Lili 2026-11-01 (point 14): the days a feed is fed, one or more periods (from a day, to a day or open), set and corrected by an admin
+// at any time. Every list of a day (the feeding sheet, the withdrawal, the intake) offers the feeds whose period covers that day; a
+// closed period takes the place of "inactive" (Feed.active is no longer read). Both days are inclusive, business days (Budapest).
+// The migration gave every feed a period from 2018-12-07: open for the active ones, ending the day before the migration for the
+// inactive ones, so today every list shows what it showed before.
+model FeedPeriod {
+  id          String    @id @default(uuid()) @db.Uuid
+  feedId      String    @db.Uuid
+  firstDay    DateTime  @db.Date
+  lastDay     DateTime? @db.Date
+  createdById String    @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  feed        Feed      @relation(fields: [feedId], references: [id])
+
+  @@index([feedId, firstDay])
+  @@map("feed_period")
+}
+
+// What the basic data step (scripts/start.sh, src/lib/base-data.ts) has created once, by the list's key: it never
+// creates that again, whatever an admin did to it since (a rename, a correction, an inactivation). Lili 2026-10-29
+// (package item 14): the feeds were looked up by NAME at every start, so a corrected name brought the feed back.
+model BaseDataMark {
+  key       String   @id
+  entityId  String   @db.Uuid
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@map("base_data_mark")
+}
+
+model FeedName {
+  id        String    @id @default(uuid()) @db.Uuid
+  feedId    String    @db.Uuid
+  name      String
+  validFrom DateTime  @db.Timestamptz(3)
+  validTo   DateTime? @db.Timestamptz(3)
+  feed      Feed      @relation(fields: [feedId], references: [id])
+
+  @@index([feedId, validFrom])
+  @@map("feed_name")
+}
+
+// EGY-09, NY-04 (open): the dose of a coral feed, versioned; the amount is copied onto the record (K4)
+model CoralFeedDose {
+  id        String    @id @default(uuid()) @db.Uuid
+  feedId    String    @db.Uuid
+  dose      Decimal   @db.Decimal(14, 4)
+  unitId    String    @db.Uuid
+  validFrom DateTime  @db.Timestamptz(3)
+  validTo   DateTime? @db.Timestamptz(3)
+  feed      Feed      @relation(fields: [feedId], references: [id])
+  unit      Unit      @relation(fields: [unitId], references: [id])
+
+  @@index([feedId, validFrom])
+  @@map("coral_feed_dose")
+}
+
+// ---------------------------------------------------------------------------
+// Areas 8, 9, 10 (stage 2): feeding days, daily selection, feeding items, eating status
+// ---------------------------------------------------------------------------
+
+enum ListState {
+  NOT_FINALIZED
+  FINALIZED
+}
+
+/// f0552bd4 (Lili 2026-11-11): how the day was fed, one choice for the day. DIVING = merüléses (M), SURFACE = felszíni (F),
+/// NONE = egyik sem (K: for the divers a fasting day).
+enum FeedingMode {
+  DIVING
+  SURFACE
+  NONE
+}
+
+// T-01, R-4: the list state of a day; its lock is the FEEDING JournalDay (one per day, NY-06 default:
+// one common list for the whole Cápárium)
+model FeedingDay {
+  id            String     @id @default(uuid()) @db.Uuid
+  businessDay   DateTime   @unique @db.Date
+  journalDayId  String     @unique @db.Uuid
+  listState     ListState  @default(NOT_FINALIZED)
+  finalizedById String?    @db.Uuid
+  finalizedAt   DateTime?  @db.Timestamptz(3)
+  /// 6fe63c9b: the day's feeds (the list's second step); empty = not chosen, every active feed is offered
+  feedIds       String[]   @default([]) @db.Uuid
+  /// f0552bd4: the day's feeding mode; null = not chosen yet
+  feedingMode   FeedingMode?
+  journalDay    JournalDay @relation(fields: [journalDayId], references: [id])
+
+  selections FeedingSelection[]
+  items      FeedingItem[]
+  statuses   EatingStatus[]
+
+  @@map("feeding_day")
+}
+
+// EGY-01, R-3: the valid row IS the selection; one valid row per (day, animal) (partial index, SQL)
+model FeedingSelection {
+  id                 String       @id @default(uuid()) @db.Uuid
+  feedingDayId       String       @db.Uuid
+  animalId           String       @db.Uuid
+  version            Int          @default(1)
+  requestId          String       @unique
+  status             RecordStatus @default(VALID)
+  invalidationReason String?
+  createdById        String       @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedById        String       @db.Uuid
+  updatedAt          DateTime     @default(now()) @db.Timestamptz(3)
+  feedingDay         FeedingDay   @relation(fields: [feedingDayId], references: [id])
+  animal             Animal       @relation(fields: [animalId], references: [id])
+
+  @@index([feedingDayId])
+  @@map("feeding_selection")
+}
+
+// EGY-02..EGY-12, DN-17 (the "given" amount): to an animal OR a group (exactly one, SQL check)
+model FeedingItem {
+  id                 String       @id @default(uuid()) @db.Uuid
+  feedingDayId       String       @db.Uuid
+  animalId           String?      @db.Uuid
+  groupId            String?      @db.Uuid
+  feedId             String       @db.Uuid
+  otherName          String?
+  version            Int          @default(1)
+  requestId          String       @unique
+  status             RecordStatus @default(VALID)
+  invalidationReason String?
+  createdById        String       @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedById        String       @db.Uuid
+  updatedAt          DateTime     @default(now()) @db.Timestamptz(3)
+  feedingDay         FeedingDay   @relation(fields: [feedingDayId], references: [id])
+  animal             Animal?      @relation(fields: [animalId], references: [id])
+  group              AnimalGroup? @relation(fields: [groupId], references: [id])
+  feed               Feed         @relation(fields: [feedId], references: [id])
+
+  quantities   FeedingQuantity[]
+  participants FeedingParticipant[]
+
+  @@index([feedingDayId])
+  @@map("feeding_item")
+}
+
+// T-08: at most one quantity per dimension (the Litopenaeus: one in pieces and one in grams)
+model FeedingQuantity {
+  id        String      @id @default(uuid()) @db.Uuid
+  itemId    String      @db.Uuid
+  quantity  Decimal     @db.Decimal(14, 4)
+  unitId    String      @db.Uuid
+  dimension Dimension
+  item      FeedingItem @relation(fields: [itemId], references: [id])
+  unit      Unit        @relation(fields: [unitId], references: [id])
+
+  @@unique([itemId, dimension])
+  @@map("feeding_quantity")
+}
+
+// R-8: who of a group was selected when the group item was saved
+model FeedingParticipant {
+  id       String      @id @default(uuid()) @db.Uuid
+  itemId   String      @db.Uuid
+  animalId String      @db.Uuid
+  item     FeedingItem @relation(fields: [itemId], references: [id])
+  animal   Animal      @relation(fields: [animalId], references: [id])
+
+  @@unique([itemId, animalId])
+  @@map("feeding_participant")
+}
+
+enum EatingState {
+  EATEN
+  PARTIAL
+  NOT_EATEN
+  FASTING
+}
+
+enum StatusSource {
+  MANUAL
+  AUTOMATIC
+}
+
+// EVE-01, EVE-02, EVE-04, EVE-11, DN-03: one valid row per (day, animal) (partial index, SQL)
+model EatingStatus {
+  id                 String       @id @default(uuid()) @db.Uuid
+  feedingDayId       String       @db.Uuid
+  animalId           String       @db.Uuid
+  state              EatingState
+  source             StatusSource @default(MANUAL)
+  vitamin            Boolean      @default(false)
+  medicine           Boolean      @default(false)
+  medicineNote       String?
+  version            Int          @default(1)
+  requestId          String       @unique
+  status             RecordStatus @default(VALID)
+  invalidationReason String?
+  createdById        String       @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedById        String       @db.Uuid
+  updatedAt          DateTime     @default(now()) @db.Timestamptz(3)
+  feedingDay         FeedingDay   @relation(fields: [feedingDayId], references: [id])
+  animal             Animal       @relation(fields: [animalId], references: [id])
+
+  @@index([feedingDayId])
+  @@map("eating_status")
+}
+
+// ---------------------------------------------------------------------------
+// Area 12 (stage 3): feed withdrawal from the freezer (KIV-01..KIV-04, T-10, DN-17 "taken out")
+// ---------------------------------------------------------------------------
+
+// KIV-03: the day's input; its lock is the WITHDRAWAL journal day (the "Lezárás" button closes it)
+model WithdrawalDay {
+  id           String     @id @default(uuid()) @db.Uuid
+  businessDay  DateTime   @unique @db.Date
+  journalDayId String     @unique @db.Uuid
+  journalDay   JournalDay @relation(fields: [journalDayId], references: [id])
+
+  items WithdrawalItem[]
+
+  @@map("withdrawal_day")
+}
+
+// KIV-01: taken out on its day for a use day (default the next day, T-10); one valid item per
+// (day, feed, other name) (partial index, SQL); at most 5 different other names a day (KIV-04)
+model WithdrawalItem {
+  id                 String        @id @default(uuid()) @db.Uuid
+  withdrawalDayId    String        @db.Uuid
+  useDay             DateTime      @db.Date
+  feedId             String        @db.Uuid
+  otherName          String?
+  version            Int           @default(1)
+  requestId          String        @unique
+  status             RecordStatus  @default(VALID)
+  invalidationReason String?
+  createdById        String        @db.Uuid
+  createdAt          DateTime      @default(now()) @db.Timestamptz(3)
+  updatedById        String        @db.Uuid
+  updatedAt          DateTime      @default(now()) @db.Timestamptz(3)
+  withdrawalDay      WithdrawalDay @relation(fields: [withdrawalDayId], references: [id])
+  feed               Feed          @relation(fields: [feedId], references: [id])
+
+  quantities WithdrawalQuantity[]
+
+  @@index([withdrawalDayId])
+  @@index([useDay])
+  @@map("withdrawal_item")
+}
+
+// T-08: at most one quantity per dimension, as for the feeding items
+model WithdrawalQuantity {
+  id        String         @id @default(uuid()) @db.Uuid
+  itemId    String         @db.Uuid
+  quantity  Decimal        @db.Decimal(14, 4)
+  unitId    String         @db.Uuid
+  dimension Dimension
+  item      WithdrawalItem @relation(fields: [itemId], references: [id])
+  unit      Unit           @relation(fields: [unitId], references: [id])
+
+  @@unique([itemId, dimension])
+  @@map("withdrawal_quantity")
+}
+
+// ---------------------------------------------------------------------------
+// Feed intake: the "Takarmányhűtő" (Lili 2026-10-29, package item 9; Balázs 2026-10-30 10:17 UTC)
+// ---------------------------------------------------------------------------
+
+// What arrives in the freezer, a few times a week. The feed stock is the sum of the valid intake that was not sent back,
+// minus the valid withdrawals (never a stored level, as the chemicals, R-16). A returned delivery stays on the list (it
+// was here) but does not count. No cell index: several deliveries of one feed may arrive on one day.
+model FeedIntakeItem {
+  id                 String               @id @default(uuid()) @db.Uuid
+  intakeDay          DateTime             @db.Date
+  feedId             String               @db.Uuid
+  otherName          String?
+  note               String?
+  returned           Boolean              @default(false)
+  version            Int                  @default(1)
+  requestId          String               @unique
+  status             RecordStatus         @default(VALID)
+  invalidationReason String?
+  createdById        String               @db.Uuid
+  createdAt          DateTime             @default(now()) @db.Timestamptz(3)
+  updatedById        String               @db.Uuid
+  updatedAt          DateTime             @default(now()) @db.Timestamptz(3)
+  feed               Feed                 @relation(fields: [feedId], references: [id])
+  quantities         FeedIntakeQuantity[]
+
+  @@index([intakeDay])
+  @@index([feedId])
+  @@map("feed_intake_item")
+}
+
+// T-08: at most one quantity per dimension, as for the withdrawal items
+model FeedIntakeQuantity {
+  id        String         @id @default(uuid()) @db.Uuid
+  itemId    String         @db.Uuid
+  quantity  Decimal        @db.Decimal(14, 4)
+  unitId    String         @db.Uuid
+  dimension Dimension
+  item      FeedIntakeItem @relation(fields: [itemId], references: [id])
+  unit      Unit           @relation(fields: [unitId], references: [id])
+
+  @@unique([itemId, dimension])
+  @@map("feed_intake_quantity")
+}
+
+// ---------------------------------------------------------------------------
+// Area 9, stage 3: the calculator, the feeding reference and the body weight log (KALK-01, KALK-02,
+// EGY-08, JAV-06)
+// ---------------------------------------------------------------------------
+
+// JAV-06: the calculator's BW comes from the last measured weight; K5 (version, status)
+model BodyWeight {
+  id                 String       @id @default(uuid()) @db.Uuid
+  animalId           String       @db.Uuid
+  measuredOn         DateTime     @db.Date
+  weightKg           Decimal      @db.Decimal(12, 4)
+  note               String?
+  version            Int          @default(1)
+  requestId          String       @unique
+  status             RecordStatus @default(VALID)
+  invalidationReason String?
+  createdById        String       @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedById        String       @db.Uuid
+  updatedAt          DateTime     @default(now()) @db.Timestamptz(3)
+  animal             Animal       @relation(fields: [animalId], references: [id])
+
+  @@index([animalId, measuredOn])
+  @@map("body_weight")
+}
+
+// KALK-01: one calculation, inputs and results as computed then (a snapshot, K4)
+model CalculatorRun {
+  id               String             @id @default(uuid()) @db.Uuid
+  animalId         String             @db.Uuid
+  bwKg             Decimal            @db.Decimal(12, 4)
+  frWeekPct        Decimal            @db.Decimal(5, 2)
+  nWeek            Int
+  frDayPct         Decimal            @db.Decimal(8, 4)
+  fKg              Decimal            @db.Decimal(12, 4)
+  fG               Decimal            @db.Decimal(14, 4)
+  fwG              Decimal            @db.Decimal(14, 4)
+  savedAsReference Boolean            @default(false)
+  requestId        String             @unique
+  createdById      String             @db.Uuid
+  createdAt        DateTime           @default(now()) @db.Timestamptz(3)
+  animal           Animal             @relation(fields: [animalId], references: [id])
+  references       FeedingReference[]
+
+  @@index([animalId, createdAt])
+  @@map("calculator_run")
+}
+
+// KALK-02, EGY-08: the planned amount per feeding for an animal or a group, versioned ("every save
+// overwrites" = a new version; an old day is measured against its own reference). One open version per
+// recipient (partial indexes, SQL); an animal OR a group (SQL check).
+model FeedingReference {
+  id              String         @id @default(uuid()) @db.Uuid
+  animalId        String?        @db.Uuid
+  groupId         String?        @db.Uuid
+  quantityG       Decimal        @db.Decimal(14, 4)
+  calculatorRunId String?        @db.Uuid
+  validFrom       DateTime       @db.Timestamptz(3)
+  validTo         DateTime?      @db.Timestamptz(3)
+  createdById     String         @db.Uuid
+  createdAt       DateTime       @default(now()) @db.Timestamptz(3)
+  animal          Animal?        @relation(fields: [animalId], references: [id])
+  group           AnimalGroup?   @relation(fields: [groupId], references: [id])
+  calculatorRun   CalculatorRun? @relation(fields: [calculatorRunId], references: [id])
+
+  @@index([animalId, validFrom])
+  @@index([groupId, validFrom])
+  @@map("feeding_reference")
+}
+
+// ---------------------------------------------------------------------------
+// Area 13 (stage 3): chemicals, dosing and their stock (ADA-01..ADA-06, JAV-09, R-16)
+// The model's shared "stock item" (area 12) is not built: feed has no stock (NY-07 default), so a
+// movement belongs to a chemical directly. If feed stock comes, the item table comes with it.
+// ---------------------------------------------------------------------------
+
+enum MovementType {
+  INTAKE
+  USAGE
+  CORRECTION
+}
+
+// JAV-09: a chemical keeps its stock in one unit; it is dosed only in units of the same dimension
+// (salt kept in g is not dosed in ml: no density)
+model Chemical {
+  id          String          @id @default(uuid()) @db.Uuid
+  stockUnitId String          @db.Uuid
+  active      Boolean         @default(true)
+  createdAt   DateTime        @default(now()) @db.Timestamptz(3)
+  stockUnit   Unit            @relation(fields: [stockUnitId], references: [id])
+  names       ChemicalName[]
+  dosings     Dosing[]
+  movements   StockMovement[]
+
+  @@map("chemical")
+}
+
+// K3: a chemical's name over time
+model ChemicalName {
+  id         String    @id @default(uuid()) @db.Uuid
+  chemicalId String    @db.Uuid
+  name       String
+  validFrom  DateTime  @db.Timestamptz(3)
+  validTo    DateTime? @db.Timestamptz(3)
+  chemical   Chemical  @relation(fields: [chemicalId], references: [id])
+
+  @@index([chemicalId, validFrom])
+  @@map("chemical_name")
+}
+
+// ADA-01, ADA-02: one dosing; it writes its USAGE movement in the same transaction (R-16)
+model Dosing {
+  id                 String         @id @default(uuid()) @db.Uuid
+  performedAt        DateTime       @db.Timestamptz(3)
+  businessDay        DateTime       @db.Date
+  poolId             String         @db.Uuid
+  chemicalId         String         @db.Uuid
+  quantity           Decimal        @db.Decimal(14, 4)
+  unitId             String         @db.Uuid
+  performedById      String         @db.Uuid
+  version            Int            @default(1)
+  requestId          String         @unique
+  status             RecordStatus   @default(VALID)
+  invalidationReason String?
+  createdById        String         @db.Uuid
+  createdAt          DateTime       @default(now()) @db.Timestamptz(3)
+  updatedById        String         @db.Uuid
+  updatedAt          DateTime       @default(now()) @db.Timestamptz(3)
+  pool               Pool           @relation(fields: [poolId], references: [id])
+  chemical           Chemical       @relation(fields: [chemicalId], references: [id])
+  unit               Unit           @relation(fields: [unitId], references: [id])
+  performedBy        User           @relation(fields: [performedById], references: [id])
+  movement           StockMovement?
+
+  @@index([businessDay])
+  @@index([chemicalId, businessDay])
+  @@map("dosing")
+}
+
+// R-16: the stock is the sum of the valid movements (never a stored level); a negative level is
+// allowed and flagged. quantity is signed, in the chemical's stock unit; the original as entered stays
+model StockMovement {
+  id                 String       @id @default(uuid()) @db.Uuid
+  chemicalId         String       @db.Uuid
+  type               MovementType
+  quantity           Decimal      @db.Decimal(14, 4)
+  originalQuantity   Decimal      @db.Decimal(14, 4)
+  originalUnitId     String       @db.Uuid
+  at                 DateTime     @db.Timestamptz(3)
+  businessDay        DateTime     @db.Date
+  dosingId           String?      @unique @db.Uuid
+  note               String?
+  version            Int          @default(1)
+  requestId          String       @unique
+  status             RecordStatus @default(VALID)
+  invalidationReason String?
+  createdById        String       @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  chemical           Chemical     @relation(fields: [chemicalId], references: [id])
+  originalUnit       Unit         @relation(fields: [originalUnitId], references: [id])
+  dosing             Dosing?      @relation(fields: [dosingId], references: [id])
+
+  @@index([chemicalId, businessDay])
+  @@map("stock_movement")
+}
+
+// JAV-08 (stage 4): the weekdays an animal is planned to be fed, to prefill the day's list. The plan and
+// the fact stay apart (V-15): a fasting day still comes only from the finalized list at the close.
+// Versioned: one open plan per animal (partial index, SQL); weekdays 1 = Monday .. 7 = Sunday.
+model FeedingPlan {
+  id          String    @id @default(uuid()) @db.Uuid
+  animalId    String    @db.Uuid
+  weekdays    Int[]
+  validFrom   DateTime  @db.Timestamptz(3)
+  validTo     DateTime? @db.Timestamptz(3)
+  createdById String    @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  animal      Animal    @relation(fields: [animalId], references: [id])
+
+  @@index([animalId, validFrom])
+  @@map("feeding_plan")
+}
+
+// NAMED FEEDING LISTS (Lili 2026-10-26, Caparium channel msg 1564356412946124921, item 1; Balázs "Mehet" 1564357004217159823):
+// an admin composes a list under a name ("Puhatestű nap": animals and feeds); a user picks it in the feeding page's header and
+// it ticks its animals on the day's list and adds its feeds to the day's feeds. A template, not a fact: the day's list stays
+// common and editable (R-7), and "Lista a terv szerint" (the weekly timetable) stays beside it. Archived, never deleted;
+// one active list per name (partial index, SQL); the members are replaced when the admin edits the list.
+model FeedingList {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  active      Boolean  @default(true)
+  createdById String   @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz(3)
+
+  animals FeedingListAnimal[]
+  feeds   FeedingListFeed[]
+
+  @@map("feeding_list")
+}
+
+model FeedingListAnimal {
+  listId   String      @db.Uuid
+  animalId String      @db.Uuid
+  list     FeedingList @relation(fields: [listId], references: [id])
+  animal   Animal      @relation(fields: [animalId], references: [id])
+
+  @@id([listId, animalId])
+  @@map("feeding_list_animal")
+}
+
+model FeedingListFeed {
+  listId String      @db.Uuid
+  feedId String      @db.Uuid
+  list   FeedingList @relation(fields: [listId], references: [id])
+  feed   Feed        @relation(fields: [feedId], references: [id])
+
+  @@id([listId, feedId])
+  @@map("feeding_list_feed")
+}
+
+// ---------------------------------------------------------------------------
+// Fridges and freezers (Lili 2026-11-02, Caparium thread msg 1566792513673764997 and 1566804526357413899; task
+// caparium-hutok): the daily temperature book of the fridges, recorded under the big pools' daily water table. Their own
+// tables on purpose: nothing here is a measurement, a parameter or a group, so the water exports, the weekly table, the
+// ZIMS and the water order never see a fridge.
+// ---------------------------------------------------------------------------
+
+enum FridgeKind {
+  FRIDGE
+  FREEZER
+}
+
+// No delete: a fridge taken out of use is closed (active = false) and may be opened again; its readings stay.
+model Fridge {
+  id          String          @id @default(uuid()) @db.Uuid
+  name        String          @unique
+  kind        FridgeKind
+  minC        Decimal         @db.Decimal(5, 1)
+  maxC        Decimal         @db.Decimal(5, 1)
+  active      Boolean         @default(true)
+  sortOrder   Int
+  createdById String          @db.Uuid
+  createdAt   DateTime        @default(now()) @db.Timestamptz(3)
+  updatedById String          @db.Uuid
+  updatedAt   DateTime        @default(now()) @db.Timestamptz(3)
+  readings    FridgeReading[]
+
+  @@map("fridge")
+}
+
+// One reading. The range valid when it was taken is kept on the row (minC, maxC), so a later change of the fridge's range
+// does not turn an old reading red or back. A correction invalidates the row and records a new one; nothing is overwritten.
+model FridgeReading {
+  id                 String       @id @default(uuid()) @db.Uuid
+  fridgeId           String       @db.Uuid
+  measuredAt         DateTime     @db.Timestamptz(3)
+  businessDay        DateTime     @db.Date
+  temperatureC       Decimal      @db.Decimal(5, 1)
+  minC               Decimal      @db.Decimal(5, 1)
+  maxC               Decimal      @db.Decimal(5, 1)
+  defrost            Boolean      @default(false)
+  note               String?
+  status             RecordStatus @default(VALID)
+  invalidationReason String?
+  version            Int          @default(1)
+  requestId          String       @unique
+  createdById        String       @db.Uuid
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedById        String       @db.Uuid
+  updatedAt          DateTime     @default(now()) @db.Timestamptz(3)
+  fridge             Fridge       @relation(fields: [fridgeId], references: [id])
+
+  @@index([businessDay])
+  @@index([fridgeId, businessDay])
+  @@map("fridge_reading")
+}

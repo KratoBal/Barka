@@ -1,0 +1,38 @@
+"use client";
+
+import { useTr } from "./LangProvider";
+import { useHydrated } from "./useHydrated";
+
+/**
+ * The page's main area, inert until React has taken the page over (card 51426546, measured on #246). On a slow tablet the markup shows
+ * first, and a value typed into a controlled field then (a water cell) showed in the field, never reached the form's state, and the
+ * Mentés after it said "Minden érték mentve." with nothing saved. Inert, the area takes no click, focus or typing in that moment; the
+ * menu around it is plain links and works. The server's markup carries the attribute too, so the hydration matches.
+ *
+ * A PAGE THAT NEVER HYDRATES (barracuda on #246, measured on #247): a script error or blocked scripts would leave the area inert for
+ * good, a page that looks ready and ignores every tap. The server's markup carries a message for that; the CSS shows it only after a
+ * few seconds (.hydration-failed), and hydration removes it before that, so a normal load never shows it.
+ */
+/**
+ * `guard` false: the page's form is a native one that posts without the page's scripts (Belépés), so nothing typed there lives in React
+ * state, and an inert area would only block the login on a page whose scripts fail (measured on #249). Shell decides: every page is
+ * guarded unless it turns it off (only Belépés; barracuda on #250).
+ */
+export function HydratedMain({ className, guard = true, children }: { className: string; guard?: boolean; children: React.ReactNode }) {
+  const hydrated = useHydrated();
+  const tr = useTr();
+  const blocked = guard && !hydrated;
+  return (
+    <>
+      {/* beside the main area, not in it: inert content is hidden from screen readers too, and an alert there would be silent */}
+      {blocked && (
+        <p className="banner banner-error hydration-failed" role="alert" data-testid="hydration-failed">
+          {tr("Az oldal nem töltődött be teljesen, ezért most nem fogad bevitelt. Frissítsd az oldalt; ha így marad, szólj az adminisztrátornak.")}
+        </p>
+      )}
+      <main className={className} inert={blocked} data-testid="main">
+        {children}
+      </main>
+    </>
+  );
+}

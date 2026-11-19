@@ -1,0 +1,134 @@
+import { sheetRecipients } from "@/lib/sheet-recipients";
+import Link from "next/link";
+import { DayControls } from "@/components/DayControls";
+import { DayRestore } from "@/components/DayRestore";
+import { DayJump, DayNav } from "@/components/DayNav";
+import { FeedingDay } from "@/components/FeedingDay";
+import { ApplyPlan } from "@/components/FeedingForms";
+import { ApplyList } from "@/components/FeedingLists";
+import type { FeedOpt, FeedTypeOpt, Recipient } from "@/components/FeedingForms";
+import { Shell } from "@/components/Shell";
+import { pageTr } from "@/lib/i18n/server";
+import { feedingHelper } from "@/lib/helpers";
+import { helperStockAccess } from "@/lib/helper-access";
+import { referencesOn } from "@/lib/calculator";
+import { prisma } from "@/lib/db";
+import { feedingDayView } from "@/lib/feeding";
+import { knownOtherNames, listFeeds } from "@/lib/feeds";
+import { activeFeedingLists } from "@/lib/feeding-lists";
+import { dayStatus } from "@/lib/journal";
+import { requireModuleRead } from "@/lib/session";
+import { sheetColumnFeeds } from "@/lib/sheet-columns";
+import { businessDayOf, isValidDay } from "@/lib/time";
+
+export const dynamic = "force-dynamic";
+
+// EGY-01..EGY-12: the common daily list (NY-06 default), then the items, totals per unit (DN-16).
+export default async function FeedingPage({ searchParams }: { searchParams: Promise<{ nap?: string }> }) {
+  const { user, level } = await requireModuleRead("FEEDING");
+  const { tr } = await pageTr(user);
+  const today = businessDayOf(new Date());
+  const sp = await searchParams;
+  const day = sp.nap && isValidDay(sp.nap) && sp.nap <= today ? sp.nap : today;
+  const [view, lock, types, units, references, otherNames, lists] = await Promise.all([
+    feedingDayView(day),
+    dayStatus(null, day, "FEEDING"),
+    // point 14: the feeds of the day being entered
+    listFeeds(new Date(), day),
+    prisma.unit.findMany({ where: { active: true }, orderBy: { symbol: "asc" } }),
+    referencesOn(day),
+    knownOtherNames(),
+    activeFeedingLists(),
+  ]);
+  const canRecord = level === "RECORD" || level === "ADMIN";
+  const isAdmin = level === "ADMIN";
+  const editable = canRecord && (isAdmin || (day === today && lock.state === "OPEN"));
+  const groups = new Map<string, { name: string; members: string[]; selected: number; color: string | null }>();
+  for (const a of view.animals) {
+    if (!a.groupId) continue;
+    const g = groups.get(a.groupId) ?? { name: a.groupName ?? "?", members: [], selected: 0, color: a.groupSheetColor };
+    g.members.push(a.id);
+    if (a.selected) g.selected += 1;
+    groups.set(a.groupId, g);
+  }
+  // the item form and the "Mai tételek" list: every selected animal and every group with a selected member, as ever
+  const recipients: Recipient[] = sheetRecipients({ animals: view.animals, items: view.items, groupRule: false });
+  // the feeding sheet: a group whose EVERY member is selected is one row, its members none of their own unless they already have an
+  // individual item; a group with only some members selected has no row, the selected members stand one by one (Lili 2026-11-10 14:03
+  // UTC, msg 1569714193307799583); on every day, by that day's membership (msg 1569694421069471836; src/lib/sheet-recipients.ts)
+  const sheetRows: Recipient[] = sheetRecipients({ animals: view.animals, items: view.items, groupRule: true });
+  const feeds: FeedOpt[] = types.flatMap((t) =>
+    t.feeds
+      .filter((f) => f.active)
+      .map((f) => ({
+        id: f.id,
+        name: f.name,
+        isOther: t.code === "EGYEB",
+        // package item 3: a feed with a base amount is a tick too, and the tick records that amount (the server sets it)
+        ...(f.sheetTick || f.dose ? { tick: true as const } : {}),
+        ...(f.dose ? { dose: `${f.dose.value.replace(".", ",")} ${f.dose.symbol}` } : {}),
+        dims: f.dimensions.map((d) => ({
+          dimension: d,
+          base: units.find((u) => u.dimension === d && u.isBase)?.symbol ?? "?",
+          units: units.filter((u) => u.dimension === d).map((u) => ({ id: u.id, symbol: u.symbol, factor: Number(u.factorToBase ?? 1) })),
+        })),
+      })),
+  );
+  // 6fe63c9b, step 2: the day's feeds narrow what is offered; "Egyéb" stays (it takes its real name per item)
+  const chosen = new Set(view.feedIds);
+  const offered = chosen.size ? feeds.filter((f) => chosen.has(f.id) || f.isOther) : feeds;
+  // the sheet's columns: the chosen feeds and the feeds already given that day; never "Egyéb" (sheet-columns.ts)
+  const sheetFeeds = sheetColumnFeeds(feeds, chosen, view.items.map((i) => i.feedId));
+  const feedTypes: FeedTypeOpt[] = types
+    .filter((t) => t.code !== "EGYEB")
+    .map((t) => ({ code: t.code, name: t.name, emoji: t.emoji, feeds: t.feeds.filter((f) => f.active).map((f) => ({ id: f.id, name: f.name })) }))
+    .filter((t) => t.feeds.length > 0);
+  return (
+    <Shell title={tr("Napi etetés")} active="feeding" user={user} helper={await feedingHelper(await helperStockAccess(user), new Date(), tr)}>
+      <div className="toolbar toolbar-end">
+        <DayNav path="/etetes" day={day} today={today} />
+        {/* Lili 2026-10-27 12:32 and 12:36 UTC (item 7): the jump calendar beside the arrows, as on the eating log */}
+        <DayJump path="/etetes" day={day} today={today} />
+        <span className="spacer" />
+        {/* Lili 2026-10-27 (item 5): the list's state moved to the "Takarmánylap kész" button at the bottom of the choice */}
+        {/* Lili 2026-10-26 (item 1): the named lists in the header, beside the weekly plan's button */}
+        {editable && lists.length > 0 && (
+          <ApplyList
+            day={day}
+            lists={lists.map((l) => ({ id: l.id, name: l.name }))}
+            selectedAnimalIds={view.animals.filter((a) => a.selected).map((a) => a.id)}
+            dayFeedIds={view.feedIds}
+          />
+        )}
+        {editable && <ApplyPlan day={day} />}
+        {/* Lili 2026-10-26 (msg 1564404799359946884): the timetable is the admin's for now; nobody else sees the entry */}
+        {isAdmin && (
+          <Link className="btn btn-soft" href="/etetes/rend">
+            {tr("Etetési rend")}
+          </Link>
+        )}
+        <DayControls kind="FEEDING" day={day} status={lock} isAdmin={isAdmin} />
+      </div>
+
+      <FeedingDay
+        day={day}
+        editable={editable}
+        finalized={view.listState === "FINALIZED"}
+        animals={view.animals}
+        groups={[...groups].map(([id, g]) => ({ id, name: g.name, members: g.members }))}
+        items={view.items}
+        totals={view.totals}
+        references={references}
+        otherNames={otherNames}
+        recipients={recipients}
+        sheetRecipients={sheetRows}
+        feeds={offered}
+        feedTypes={feedTypes}
+        dayFeedIds={view.feedIds}
+        sheetFeeds={sheetFeeds}
+        lock={{ kind: "FEEDING", day, status: lock, isAdmin }}
+      />
+      {isAdmin && <DayRestore day={day} />}
+    </Shell>
+  );
+}

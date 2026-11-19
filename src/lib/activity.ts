@@ -1,0 +1,341 @@
+// The admin's activity page (card 70cadcf8, Lili 2026-10-30 10:33 UTC: "who did what, but not an endless table:
+// a summary to click into"). It reads the audit log only; nothing here writes.
+//
+// Two rules decide every number on the page:
+// - ONE SAVE COUNTS ONCE. A save writes several audit rows under one requestId: a feeding save also writes the
+//   automatic fasting and invalidated eating statuses (src/lib/feeding.ts), a withdrawal its journal day. The page
+//   counts saves, never rows; a row without a requestId (an export, a day close) is a save of its own.
+// - A SAVE BELONGS TO ONE KIND: the first of ACTIVITY_KINDS, in their order, that its rows touch. The eating log is
+//   last because other saves write eating statuses as a side effect; a save that writes ONLY eating statuses (or
+//   body weights) is an eating-log save.
+// The system's own writes (the automatic day close, SYSTEM_USER_ID) and the login rows are not anybody's data entry.
+
+import type { AuditAction } from "@prisma/client";
+import { prisma, SYSTEM_USER_ID } from "./db";
+import { addDays, businessDayOf, localTimeOf, resolveLocalDateTime } from "./time";
+
+export type ActivityKindKey = "water" | "fridges" | "feeding" | "withdrawal" | "dosing" | "animals" | "settings" | "export" | "eating";
+
+export type ActivityKind = { key: ActivityKindKey; label: string; entityTypes: readonly string[] };
+
+/**
+ * Every entity type an audit row is written for, by kind, in the order that decides a save's kind. A new entity
+ * type must be added here: tests/unit/activity.test.ts reads every `entityType: "..."` in src and fails on one
+ * that has no kind, so a new kind of record cannot drop out of the page unnoticed.
+ */
+export const ACTIVITY_KINDS: readonly ActivityKind[] = [
+  { key: "water", label: "Vízmérés", entityTypes: ["Measurement", "MeasurementRound", "PoolTick"] },
+  // the fridges' temperature book (task caparium-hutok): recorded on the water page, but its own kind, as it is its own data
+  { key: "fridges", label: "Hűtők", entityTypes: ["FridgeReading", "Fridge"] },
+  {
+    key: "feeding",
+    label: "Napi etetés",
+    entityTypes: ["FeedingDay", "FeedingItem", "FeedingList", "FeedingSelection", "FeedingPlan", "FeedingReference", "CalculatorRun"],
+  },
+  { key: "withdrawal", label: "Fagyasztó és kivétel", entityTypes: ["FeedIntakeItem", "WithdrawalItem"] },
+  { key: "dosing", label: "Vegyszeradagolás", entityTypes: ["Dosing", "StockMovement"] },
+  { key: "animals", label: "Állatok", entityTypes: ["Animal", "AnimalGroup", "AnimalOrder", "LifecycleEvent", "InitialAnimalList", "Species"] },
+  {
+    key: "settings",
+    label: "Beállítások",
+    entityTypes: ["Feed", "FeedOrder", "Chemical", "Pool", "Parameter", "ParameterOrder", "ReferenceRange", "ParameterConversion", "Setting", "User"],
+  },
+  { key: "export", label: "Export, levél, napzárás", entityTypes: ["ExportRun", "MonthlyZimsMail", "WaterReportMail", "JournalDay"] },
+  { key: "eating", label: "Evési napló", entityTypes: ["EatingStatus", "BodyWeight"] },
+];
+
+const KIND_OF = new Map<string, ActivityKindKey>(ACTIVITY_KINDS.flatMap((k) => k.entityTypes.map((t) => [t, k.key] as const)));
+const KIND_ORDER = new Map<ActivityKindKey, number>(ACTIVITY_KINDS.map((k, i) => [k.key, i]));
+
+/** The kind of one entity type, or null for one that is not in ACTIVITY_KINDS. */
+export function kindOf(entityType: string): ActivityKindKey | null {
+  return KIND_OF.get(entityType) ?? null;
+}
+
+/** Not data entry: who logged in or out. */
+export const EXCLUDED_ACTIONS: readonly AuditAction[] = ["LOGIN", "LOGIN_FAILED", "LOGOUT"];
+
+/**
+ * THE ACTIVE TIME'S GAP (Lili 2026-11-11, task caparium-aktivitas-idosav): a pause between two saves longer than this is not
+ * counted as data entry. One place to change it; the page's and the CSV's header say it.
+ */
+export const ACTIVE_GAP_MINUTES = 30;
+export const ACTIVE_LABEL = `Aktív idő (${ACTIVE_GAP_MINUTES} percnél hosszabb szünet nélkül)`;
+
+/** The longest period the page reads at once (days, both ends counted). */
+export const MAX_ACTIVITY_DAYS = 31;
+
+export type ActivityRow = {
+  id: bigint;
+  at: Date;
+  userId: string;
+  action: AuditAction;
+  entityType: string;
+  entityId: string;
+  requestId: string | null;
+  reason: string | null;
+};
+
+export type ActivitySave = {
+  key: string;
+  day: string;
+  userId: string;
+  kind: ActivityKindKey | "other";
+  /** the first row's instant */
+  at: Date;
+  rows: ActivityRow[];
+};
+
+/** The rows grouped into saves (one requestId, or one row without it), each with its day, user and kind. */
+export function groupSaves(rows: readonly ActivityRow[]): ActivitySave[] {
+  const byKey = new Map<string, ActivityRow[]>();
+  for (const r of rows) {
+    if (r.userId === SYSTEM_USER_ID || EXCLUDED_ACTIONS.includes(r.action)) continue;
+    // a requestId is the client's, so it is keyed with the user too: two users cannot share one save
+    const key = r.requestId ? `${r.userId}|${r.requestId}` : `${r.userId}|row:${r.id}`;
+    const list = byKey.get(key);
+    if (list) list.push(r);
+    else byKey.set(key, [r]);
+  }
+  const saves: ActivitySave[] = [];
+  for (const [key, list] of byKey) {
+    list.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    let kind: ActivityKindKey | "other" = "other";
+    let best = Infinity;
+    for (const r of list) {
+      const k = kindOf(r.entityType);
+      if (k !== null && KIND_ORDER.get(k)! < best) {
+        best = KIND_ORDER.get(k)!;
+        kind = k;
+      }
+    }
+    saves.push({ key, day: businessDayOf(list[0].at), userId: list[0].userId, kind, at: list[0].at, rows: list });
+  }
+  return saves.sort((a, b) => b.at.getTime() - a.at.getTime());
+}
+
+export type ActivitySummaryRow = {
+  day: string;
+  userId: string;
+  counts: Partial<Record<ActivityKindKey | "other", number>>;
+  total: number;
+  /** The day's first and last save of the person (Lili 2026-11-11, task caparium-aktivitas-idosav): the span it took. */
+  first: Date;
+  last: Date;
+  /** The audit rows behind the saves: a save can write several. */
+  rows: number;
+  /** The time spent on the saves: each save's own span and the pauses between them up to ACTIVE_GAP_MINUTES (ms). */
+  activeMs: number;
+};
+
+/**
+ * The active time of one person's saves on one day: the saves in time order, each one's span counted once (overlaps
+ * merged), and a pause between two saves only when it is at most ACTIVE_GAP_MINUTES. One lone save is its own span.
+ */
+export function activeMs(spans: readonly { start: Date; end: Date }[]): number {
+  const gap = ACTIVE_GAP_MINUTES * 60_000;
+  let total = 0;
+  let cursor: number | null = null;
+  for (const { start, end } of [...spans].sort((a, b) => a.start.getTime() - b.start.getTime())) {
+    const s = start.getTime();
+    const e = Math.max(end.getTime(), s);
+    if (cursor !== null && s > cursor && s - cursor <= gap) total += s - cursor;
+    const from = cursor === null ? s : Math.max(s, cursor);
+    if (e > from) total += e - from;
+    cursor = cursor === null ? e : Math.max(cursor, e);
+  }
+  return total;
+}
+
+/** "1:05": hours and minutes of a duration, for the page and the CSV. */
+export function formatDuration(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  return `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+/** One row per day and user that has a save, newest day first; the cells count saves. */
+export function summarize(saves: readonly ActivitySave[]): ActivitySummaryRow[] {
+  const byKey = new Map<string, ActivitySummaryRow>();
+  const spans = new Map<string, { start: Date; end: Date }[]>();
+  for (const s of saves) {
+    const key = `${s.day}|${s.userId}`;
+    // a save's own span: its first and its last row (the rows of one save are in id order)
+    const end = s.rows[s.rows.length - 1].at;
+    let row = byKey.get(key);
+    if (!row) {
+      row = { day: s.day, userId: s.userId, counts: {}, total: 0, first: s.at, last: end, rows: 0, activeMs: 0 };
+      byKey.set(key, row);
+      spans.set(key, []);
+    }
+    spans.get(key)!.push({ start: s.at, end });
+    row.counts[s.kind] = (row.counts[s.kind] ?? 0) + 1;
+    row.total += 1;
+    row.rows += s.rows.length;
+    if (s.at < row.first) row.first = s.at;
+    if (end > row.last) row.last = end;
+  }
+  for (const [key, row] of byKey) row.activeMs = activeMs(spans.get(key)!);
+  return [...byKey.values()].sort((a, b) => (a.day === b.day ? a.userId.localeCompare(b.userId) : a.day < b.day ? 1 : -1));
+}
+
+/** The first and the last business day of the period, clamped to MAX_ACTIVITY_DAYS ending at `to`. */
+export function clampPeriod(from: string, to: string): { from: string; to: string } {
+  const earliest = addDays(to, -(MAX_ACTIVITY_DAYS - 1));
+  return { from: from < earliest ? earliest : from > to ? to : from, to };
+}
+
+/**
+ * The audit rows of the period's business days (Europe/Budapest), optionally of one user. A row's day is the
+ * business day of its server time: an activity log says when the save reached the server.
+ */
+export async function loadActivityRows(period: { from: string; to: string }, userId?: string): Promise<ActivityRow[]> {
+  const start = resolveLocalDateTime(`${period.from}T00:00`)!.instant;
+  const end = resolveLocalDateTime(`${addDays(period.to, 1)}T00:00`)!.instant;
+  return prisma.auditEntry.findMany({
+    where: {
+      at: { gte: start, lt: end },
+      userId: userId ? userId : { not: SYSTEM_USER_ID },
+      action: { notIn: [...EXCLUDED_ACTIONS] },
+    },
+    select: { id: true, at: true, userId: true, action: true, entityType: true, entityId: true, requestId: true, reason: true },
+    orderBy: { id: "asc" },
+  });
+}
+
+/** What a save touched, in the words of the app's menus. */
+export const ENTITY_LABEL: Readonly<Record<string, string>> = {
+  Measurement: "vízmérés",
+  MeasurementRound: "mérési kör",
+  PoolTick: "medence-pipa",
+  FridgeReading: "hűtő-leolvasás",
+  Fridge: "hűtő",
+  FeedingDay: "etetési nap",
+  FeedingItem: "takarmánytétel",
+  FeedingList: "etetési lista",
+  FeedingSelection: "etetett állat",
+  FeedingPlan: "etetési terv",
+  FeedingReference: "etetési referencia",
+  CalculatorRun: "kalkuláció",
+  FeedIntakeItem: "takarmány-beérkezés",
+  WithdrawalItem: "takarmánykivétel",
+  Dosing: "adagolás",
+  StockMovement: "vegyszerkészlet",
+  Animal: "állat",
+  AnimalGroup: "állatcsoport",
+  AnimalOrder: "állat-sorrend",
+  LifecycleEvent: "életciklus-esemény",
+  InitialAnimalList: "kezdő állatlista",
+  Species: "faj",
+  Feed: "takarmány",
+  FeedOrder: "takarmány-sorrend",
+  ParameterOrder: "mérés-sorrend",
+  Chemical: "vegyszer",
+  Pool: "medence",
+  Parameter: "mérésfajta",
+  ReferenceRange: "referenciaérték",
+  ParameterConversion: "mérőeszköz-átváltás",
+  Setting: "beállítás",
+  User: "felhasználó",
+  ExportRun: "export",
+  MonthlyZimsMail: "havi ZIMS-levél",
+  WaterReportMail: "vízmérés-kiküldés",
+  JournalDay: "napzárás",
+  EatingStatus: "evési állapot",
+  BodyWeight: "testtömeg",
+};
+
+export const ACTION_LABEL: Readonly<Record<AuditAction, string>> = {
+  CREATE: "rögzítés",
+  UPDATE: "módosítás",
+  INVALIDATE: "érvénytelenítés",
+  CLOSE: "lezárás",
+  REOPEN: "újranyitás",
+  MASTER_CHANGE: "törzsadat-változás",
+  MASTER_CORRECTION: "törzsadat-helyesbítés",
+  EXPORT: "export",
+  LOGIN: "belépés",
+  LOGIN_FAILED: "sikertelen belépés",
+  LOGOUT: "kilépés",
+  CONFLICT_REJECTED: "ütközés miatt elutasítva",
+  PENDING_CREATED: "függő mentés",
+  PENDING_APPROVED: "függő mentés elfogadva",
+  PENDING_REJECTED: "függő mentés elutasítva",
+  ANONYMIZE: "anonimizálás",
+};
+
+/** "rögzítés: 2 vízmérés, mérési kör": a save's rows in one line, the action first. */
+export function describeSave(rows: readonly ActivityRow[]): string {
+  const byAction = new Map<AuditAction, Map<string, number>>();
+  for (const r of rows) {
+    const m = byAction.get(r.action) ?? new Map<string, number>();
+    m.set(r.entityType, (m.get(r.entityType) ?? 0) + 1);
+    byAction.set(r.action, m);
+  }
+  return [...byAction]
+    .map(([action, types]) => {
+      const what = [...types].map(([t, n]) => `${n > 1 ? `${n} ` : ""}${ENTITY_LABEL[t] ?? t}`).join(", ");
+      return `${ACTION_LABEL[action]}: ${what}`;
+    })
+    .join("; ");
+}
+
+/** The page's query keys: `ember` filters the summary, `ki` is the person of the opened cell. */
+export type ActivityParams = Partial<Record<"tol" | "ig" | "ember" | "ki" | "nap" | "fajta" | "oldal", string>>;
+
+/**
+ * The page's query, one value per key. Next.js gives a key that appears twice as an array; its first value counts.
+ * Before this, a cell link repeated `ember` and the detail vanished on the second click (barracuda, #136).
+ */
+export function readActivityParams(raw: Record<string, string | string[] | undefined>): ActivityParams {
+  const out: ActivityParams = {};
+  for (const key of ["tol", "ig", "ember", "ki", "nap", "fajta", "oldal"] as const) {
+    const v = raw[key];
+    const value = Array.isArray(v) ? v[0] : v;
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/** A link of the page: the period and the filter, then what the link opens; every key at most once. */
+export function activityHref(view: { from: string; to: string; filter?: string }, open?: { day: string; person: string; kind: string; page?: number }): string {
+  const q = new URLSearchParams({ tol: view.from, ig: view.to });
+  if (view.filter) q.set("ember", view.filter);
+  if (open) {
+    q.set("nap", open.day);
+    q.set("ki", open.person);
+    q.set("fajta", open.kind);
+    if (open.page && open.page > 1) q.set("oldal", String(open.page));
+  }
+  return `/aktivitas?${q.toString()}${open ? "#reszlet" : ""}`;
+}
+
+/** One CSV cell: quoted when it holds the separator, a quote or a line break. */
+function csvCell(value: string | number): string {
+  // a text that starts like a formula opens as one in Excel (barracuda on #223): an apostrophe keeps it text; numbers are
+  // left as they are, a negative number is no formula
+  const text = typeof value === "string" && /^[=+\-@\t\r]/.test(value) ? `'${value}` : String(value);
+  return /[;"\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/**
+ * The summary as a CSV (task caparium-aktivitas-idosav, Lili 2026-11-11): the same rows and numbers as the page, with the
+ * first and last save's local time. Semicolon-separated with a BOM, so a Hungarian Excel opens it in columns.
+ */
+export function activityCsv(rows: readonly ActivitySummaryRow[], nameOf: (userId: string) => string): string {
+  const kinds = [...ACTIVITY_KINDS.map((k) => ({ key: k.key as ActivityKindKey | "other", label: k.label }))];
+  if (rows.some((r) => r.counts.other)) kinds.push({ key: "other", label: "Egyéb" });
+  const head = ["Nap", "Felhasználó", "Első mentés", "Utolsó mentés", ACTIVE_LABEL, "Mentések", "Sorok", ...kinds.map((k) => k.label)];
+  const lines = rows.map((r) =>
+    [r.day, nameOf(r.userId), localTimeOf(r.first), localTimeOf(r.last), formatDuration(r.activeMs), r.total, r.rows, ...kinds.map((k) => r.counts[k.key] ?? 0)]
+      .map(csvCell)
+      .join(";"),
+  );
+  return `\uFEFF${[head.map(csvCell).join(";"), ...lines].join("\r\n")}\r\n`;
+}
+
+/** The CSV download of a view: the same period and filter as the page. */
+export function activityCsvHref(view: { from: string; to: string; filter?: string }): string {
+  const q = new URLSearchParams({ tol: view.from, ig: view.to });
+  if (view.filter) q.set("ember", view.filter);
+  return `/api/aktivitas/csv?${q.toString()}`;
+}

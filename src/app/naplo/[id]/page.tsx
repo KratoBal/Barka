@@ -1,0 +1,144 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { CorrectionForm } from "@/components/CorrectionForm";
+import { Shell } from "@/components/Shell";
+import { pageTr } from "@/lib/i18n/server";
+import type { TrVars } from "@/lib/i18n/translate";
+import { prisma } from "@/lib/db";
+import { canModify } from "@/lib/permissions";
+import { formatDecimalHu } from "@/lib/decimal";
+import { responsiblePeople } from "@/lib/master";
+import { measurementHistory } from "@/lib/queries";
+import { requireModuleRead } from "@/lib/session";
+import { businessDayOf, dayToDate, formatDateTime, formatDay } from "@/lib/time";
+
+export const dynamic = "force-dynamic";
+
+const FIELD_LABEL: Record<string, string> = {
+  value: "Érték",
+  measuredAt: "Mérés időpontja",
+  businessDay: "Nap",
+  responsibleUserId: "Mérést végezte",
+  traineePerformed: "Gyakornok végezte",
+  dilution: "Hígítás",
+  diluentWater: "Hígító víz",
+  status: "Állapot",
+  invalidationReason: "Érvénytelenítés oka",
+  roundId: "Mérési kör",
+};
+// technical fields stay in the audit, but are not shown to the user
+const HIDDEN = new Set(["poolId", "parameterId", "unitId", "referenceRangeId", "version", "roundId"]);
+
+function show(v: unknown, tr: (text: string, vars?: TrVars) => string): string {
+  if (v === null || v === undefined || v === "") return "–";
+  if (typeof v === "boolean") return v ? tr("igen") : tr("nem");
+  if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
+    return formatDateTime(v);
+  }
+  if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)) return formatDay(v);
+  return String(v);
+}
+
+export default async function MeasurementHistoryPage({ params }: { params: Promise<{ id: string }> }) {
+  const { user, level } = await requireModuleRead("WATER");
+  const { tr } = await pageTr(user);
+  const { id } = await params;
+  if (!/^[0-9a-f-]{36}$/.test(id)) notFound();
+  const h = await measurementHistory(id);
+  if (!h) notFound();
+  const m = h.measurement;
+  const out = m.reference === "LOW" || m.reference === "HIGH";
+  // the same rule the server applies on save; here it only decides whether the form is shown
+  const journal = await prisma.journalDay.findFirst({
+    where: { kind: "WATER", groupId: m.groupId, businessDay: dayToDate(m.businessDay) },
+  });
+  const decision =
+    m.status === "VALID"
+      ? canModify(level, {
+          day: m.businessDay,
+          today: businessDayOf(new Date()),
+          closed: journal?.state === "CLOSED",
+          isOwn: m.createdById === user.id,
+          othersToo: true,
+        })
+      : null;
+  const people = decision?.kind === "ALLOW" ? await responsiblePeople(m.businessDay, businessDayOf(new Date())) : [];
+  return (
+    <Shell title={tr("Mérés előzménye")} active="log" user={user}>
+      <p>
+        <Link href="/naplo">← {tr("Vissza a naplóhoz")}</Link>
+      </p>
+      <div className="card">
+        <h2>
+          {m.poolName} · {tr(m.parameterName)}
+        </h2>
+        <p className="hint">
+          {formatDay(m.businessDay)} {m.localTime} · {m.groupName},{" "}
+          {tr("{round}. mérés · mérte: {who} · rögzítette: {by}", { round: m.roundSeq, who: m.responsibleMonogram, by: m.createdByName })}
+        </p>
+        <p style={{ fontSize: 28, margin: "16px 0 0" }} className={out ? "value-out" : undefined} data-testid="history-value">
+          {formatDecimalHu(m.value, m.decimals)} {m.unitSymbol !== m.parameterName ? m.unitSymbol : ""}
+        </p>
+        {m.baseValue !== null && m.dilution !== null && (
+          <p className="hint" data-testid="history-base-value">
+            {tr("Hígítás előtt:")} {m.baseValue.replace(".", ",")} × {m.dilution}
+          </p>
+        )}
+        {out && m.range && (
+          <p className="hint">
+            {tr("Eltérés a referenciától")} ({m.range.min ?? "–"}–{m.range.max ?? "–"} {m.range.unitSymbol})
+          </p>
+        )}
+        <p>
+          {tr("Állapot:")} <b data-testid="history-status">{tr(m.status === "VALID" ? "érvényes" : m.status === "INVALIDATED" ? "érvénytelenített" : "függő")}</b>
+          {m.invalidationReason ? ` (${tr("ok: {reason}", { reason: m.invalidationReason })})` : ""}
+        </p>
+      </div>
+      {decision?.kind === "ALLOW" && (
+        <CorrectionForm
+          measurement={{
+            id: m.id,
+            version: m.version,
+            // the field takes the reading; the server multiplies it by the dilution again
+            value: m.baseValue ?? m.value,
+            measuredAtLocal: m.measuredAtLocal,
+            responsibleUserId: m.responsibleUserId,
+            traineePerformed: m.traineePerformed,
+            dilution: m.dilution,
+            diluentWater: m.diluentWater,
+            dilutable: m.dilutable,
+          }}
+          people={people}
+          reasonRequired={decision.reasonRequired}
+        />
+      )}
+      {decision?.kind === "DENY" && (
+        <p className="hint" data-testid="correction-denied">
+          {decision.message}
+        </p>
+      )}
+      <div className="card">
+        <h2>{tr("Módosítási előzmények")}</h2>
+        <p className="hint">{tr("Minden rögzítés, javítás és érvénytelenítés: ki, mikor, mit, előtte és utána.")}</p>
+        {h.entries.map((e) => (
+          <div key={e.id} className="history-item" data-testid="history-entry">
+            <div className="when">
+              {formatDay(e.localDay)} {e.localTime} · {e.userName} ({e.userMonogram})
+            </div>
+            <b>{e.actionLabel}</b>
+            {e.reason && <div>{tr("Indoklás:")} {e.reason}</div>}
+            <ul>
+              {Object.entries(e.changes)
+                .filter(([k]) => !HIDDEN.has(k))
+                .map(([k, c]) => (
+                  <li key={k}>
+                    {FIELD_LABEL[k] ? tr(FIELD_LABEL[k]) : k}: {e.action === "CREATE" || e.action === "PENDING_CREATED" ? show(c.after, tr) : `${show(c.before, tr)} → ${show(c.after, tr)}`}
+                  </li>
+                ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </Shell>
+  );
+}

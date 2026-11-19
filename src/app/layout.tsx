@@ -1,0 +1,38 @@
+import type { Metadata, Viewport } from "next";
+import "./globals.css";
+import { THEME_COLOR } from "@/lib/app-theme";
+import { EnterNext } from "@/components/EnterNext";
+import { pageLang } from "@/lib/i18n/server";
+
+export const metadata: Metadata = {
+  title: "Cápárium nAPPló",
+  description: "A Cápárium vízmérési és etetési naplója",
+  // the home screen (Lili 2026-10-31, task caparium-webapp-ikon): the manifest (src/app/manifest.ts), the icons, and the iOS meta tags that make
+  // the app open full screen with the name "Caparium" (iOS asks for the name itself when it is added)
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [{ url: "/icons/icon-32.png", sizes: "32x32", type: "image/png" }],
+    apple: [{ url: "/icons/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
+  appleWebApp: { capable: true, title: "Caparium", statusBarStyle: "default" },
+  // Next 16 writes appleWebApp.capable as "mobile-web-app-capable" (the name Chrome reads); iOS Safari's own, older name is added next to it
+  other: { "apple-mobile-web-app-capable": "yes" },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: THEME_COLOR,
+};
+
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  // the device's language (lib/i18n/lang.ts): a screen reader and the browser's own words follow it
+  return (
+    <html lang={await pageLang()}>
+      <body>
+        <EnterNext />
+        {children}
+      </body>
+    </html>
+  );
+}
